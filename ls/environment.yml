@@ -1,0 +1,13 @@
+# MCC 2026 conda env (login node: conda env create -f environment.yml)
+name: mcc
+channels:
+  - conda-forge
+dependencies:
+  - python=3.9
+  - numpy
+  - netcdf4
+  - pip
+  # PyTorch: on Kunshan DCU cluster prefer module load + pip from site guide.
+  # Uncomment ONE of the following if installing on CPU dev machine:
+  # - pytorch
+  # - cpuonly

@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+
+# Claude
+.claude/
+
+# Output data (large)
+ERA5/Climatology/
+
+# Logs
+logs/
+
+# Personal files
+pan2174.txt
+pan2174.zip
+
+# MATLAB binary
+*.mat

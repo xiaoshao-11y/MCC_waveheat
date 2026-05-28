@@ -1,0 +1,86 @@
+WORKDIR=/public/home/pan2174/ls
+Loaded devtoolset module: compiler/devtoolset/7.3.1
+Loaded DTK module: compiler/dtk/24.04.3
+Loaded MPI module: mpi/hpcx/2.7.4/gcc-7.3.1
+PYTHON=/public/home/pan2174/miniconda3/envs/mcc-gpu/bin/python
+SLURM_GPUS=unset MCC_NUM_GPU=4 dtype=float16
+shell_setup: 1s
+[cache] unique dates: 3060 (avoid 30360 repeated per-DOY reads)
+[pipeline] io_read || setup in parallel
+  reading 3060 files grain=year backend=process workers=16 ...
+  year-grain: 30 years, 16 workers
+  ... 102/3060 files (11.2s)
+  ... 204/3060 files (11.7s)
+  ... 306/3060 files (11.9s)
+  ... 408/3060 files (12.2s)
+  ... 510/3060 files (12.3s)
+  ... 612/3060 files (12.4s)
+  ... 714/3060 files (12.5s)
+  ... 816/3060 files (12.6s)
+  ... 918/3060 files (12.7s)
+  ... 1020/3060 files (12.9s)
+  ... 1122/3060 files (13.0s)
+  ... 1224/3060 files (13.3s)
+  ... 1326/3060 files (13.5s)
+  ... 1428/3060 files (13.8s)
+  ... 1530/3060 files (14.0s)
+  ... 1632/3060 files (14.1s)
+  ... 1734/3060 files (17.7s)
+  ... 1836/3060 files (17.8s)
+  ... 1938/3060 files (19.4s)
+  ... 2040/3060 files (19.6s)
+  ... 2142/3060 files (19.6s)
+  ... 2244/3060 files (19.8s)
+  ... 2346/3060 files (19.8s)
+  ... 2448/3060 files (19.9s)
+  ... 2550/3060 files (20.0s)
+  ... 2652/3060 files (20.1s)
+  ... 2754/3060 files (20.7s)
+  ... 2856/3060 files (20.8s)
+  ... 2958/3060 files (20.9s)
+  ... 3060/3060 files (21.0s)
+  read done 21.0s (0.007s/file)
+[setup] parent pre-imported torch 35.4s (parallel to io_read)
+[setup] cuda probe(skip torch) -> slurm_visible=4
+[cache] shape=(3060, 721, 1440) read=21.0s
+nc_path=/public/home/achwjznh4b/Newdata/
+save_path=/public/home/pan2174/ERA5/Climatology/
+device=multi compute_dtype=float16 num_gpu=4 cuda_count=4 io=16(process) grain=year
+DOY 152..243
+[multi-gpu] 4 workers, DOY chunks: [23, 23, 23, 23] (fork+cuda:0..3)
+[gpu2] cuda:2 (Z200SM_71) init 17.7s
+[gpu1] cuda:1 (Z200SM_71) init 17.7s
+[gpu3] cuda:3 (Z200SM_71) init 17.7s
+[gpu0] cuda:0 (Z200SM_71) init 17.7s
+Could not open /var/log/hylog/.
+Could not open /var/log/hylog/.
+Could not open /var/log/hylog/.
+Could not open /var/log/hylog/.
+[gpu1] done 23 DOYs gather=3.1s compute=14.8s write=0.5s
+[gpu2] done 23 DOYs gather=3.2s compute=15.1s write=0.7s
+[gpu3] done 23 DOYs gather=3.7s compute=14.9s write=0.7s
+[gpu0] done 23 DOYs gather=3.6s compute=15.0s write=0.8s
+[multi-gpu] gpu0 23 DOYs init=17.7s gather=3.6s compute=15.0s write=0.8s
+[multi-gpu] gpu1 23 DOYs init=17.7s gather=3.1s compute=14.8s write=0.5s
+[multi-gpu] gpu2 23 DOYs init=17.7s gather=3.2s compute=15.1s write=0.7s
+[multi-gpu] gpu3 23 DOYs init=17.7s gather=3.7s compute=14.9s write=0.7s
+[multi-gpu] wall 37.5s (parallel max~15.1s compute per gpu)
+
+========== TIMING SUMMARY ==========
+  setup:         53.2s   71.5% (n=2)  [26.59s avg]
+  io_plan:        1.3s    1.7%
+  io_read:       26.8s   36.0%
+  io_gather:      3.7s    5.0% (n=92)  [0.04s avg]
+  compute:       37.5s   50.5% (n=92)  [0.41s avg]
+  write:          0.8s    1.1% (n=92)  [0.01s avg]
+  mp_spawn:       0.0s    0.0%
+  overlap:       48.9s  (setup/io/write overlapped, not additive)
+  TOTAL:         74.3s    1.2min
+====================================
+
+real	1m30.006s
+user	1m54.440s
+sys	0m45.317s
+python_wall: 90s
+task_total_wall: 91s
+=== finished ===

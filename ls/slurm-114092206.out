@@ -1,0 +1,81 @@
+WORKDIR=/public/home/pan2174/ls
+Loaded devtoolset module: compiler/devtoolset/7.3.1
+Loaded DTK module: compiler/dtk/24.04.3
+Loaded MPI module: mpi/hpcx/2.7.4/gcc-7.3.1
+PYTHON=/public/home/pan2174/miniconda3/envs/mcc-gpu/bin/python
+SLURM_GPUS=unset MCC_NUM_GPU=4 dtype=float16
+shell_setup: 0s
+[cache] unique dates: 3060 (avoid 30360 repeated per-DOY reads)
+[pipeline] io_read || setup in parallel
+[setup] cuda probe(skip torch) -> slurm_visible=4
+  reading 3060 files grain=year backend=process workers=16 ...
+  year-grain: 30 years, 16 workers
+  ... 102/3060 files (10.9s)
+  ... 204/3060 files (11.1s)
+  ... 306/3060 files (11.2s)
+  ... 408/3060 files (11.3s)
+  ... 510/3060 files (11.4s)
+  ... 612/3060 files (11.5s)
+  ... 714/3060 files (11.5s)
+  ... 816/3060 files (11.6s)
+  ... 918/3060 files (11.7s)
+  ... 1020/3060 files (11.8s)
+  ... 1122/3060 files (11.8s)
+  ... 1224/3060 files (11.9s)
+  ... 1326/3060 files (12.0s)
+  ... 1428/3060 files (12.0s)
+  ... 1530/3060 files (12.1s)
+  ... 1632/3060 files (12.2s)
+  ... 1734/3060 files (16.7s)
+  ... 1836/3060 files (16.7s)
+  ... 1938/3060 files (17.1s)
+  ... 2040/3060 files (17.2s)
+  ... 2142/3060 files (18.2s)
+  ... 2244/3060 files (18.3s)
+  ... 2346/3060 files (18.6s)
+  ... 2448/3060 files (19.0s)
+  ... 2550/3060 files (19.1s)
+  ... 2652/3060 files (19.3s)
+  ... 2754/3060 files (19.9s)
+  ... 2856/3060 files (20.0s)
+  ... 2958/3060 files (20.0s)
+  ... 3060/3060 files (20.1s)
+  read done 20.1s (0.007s/file)
+[cache] shape=(3060, 721, 1440) read=20.1s
+nc_path=/public/home/achwjznh4b/Newdata/
+save_path=/public/home/pan2174/ERA5/Climatology/
+device=multi compute_dtype=float16 num_gpu=4 cuda_count=4 io=16(process) grain=year
+DOY 152..243
+[multi-gpu] 4 workers, DOY chunks: [23, 23, 23, 23] (fork+cuda:0..3)
+[gpu2] cuda:2 (Z200SM_71) init 13.4s
+[gpu1] cuda:1 (Z200SM_71) init 13.4s
+[gpu3] cuda:3 (Z200SM_71) init 13.4s
+[gpu0] cuda:0 (Z200SM_71) init 13.4s
+[gpu3] done 23 DOYs gather=21.3s compute=37.7s write=0.3s
+[gpu0] done 23 DOYs gather=21.1s compute=38.0s write=0.4s
+[gpu1] done 23 DOYs gather=21.5s compute=38.1s write=0.4s
+[gpu2] done 23 DOYs gather=22.2s compute=37.7s write=0.4s
+[multi-gpu] gpu0 23 DOYs init=13.4s gather=21.1s compute=38.0s write=0.4s
+[multi-gpu] gpu1 23 DOYs init=13.4s gather=21.5s compute=38.1s write=0.4s
+[multi-gpu] gpu2 23 DOYs init=13.4s gather=22.2s compute=37.7s write=0.4s
+[multi-gpu] gpu3 23 DOYs init=13.4s gather=21.3s compute=37.7s write=0.3s
+[multi-gpu] wall 105.9s (parallel max~38.1s compute per gpu)
+
+========== TIMING SUMMARY ==========
+  setup:         13.5s   10.5% (n=2)  [6.74s avg]
+  io_plan:        1.3s    1.0%
+  io_read:       21.0s   16.3%
+  io_gather:     22.2s   17.3% (n=92)  [0.24s avg]
+  compute:      105.9s   82.6% (n=92)  [1.15s avg]
+  write:          0.4s    0.3% (n=92)  [0.00s avg]
+  mp_spawn:       0.0s    0.0%
+  overlap:       36.0s  (setup/io/write overlapped, not additive)
+  TOTAL:        128.2s    2.1min
+====================================
+
+real	2m15.088s
+user	4m10.546s
+sys	1m21.064s
+python_wall: 135s
+task_total_wall: 135s
+=== finished ===
