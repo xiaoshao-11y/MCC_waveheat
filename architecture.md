@@ -205,7 +205,7 @@ MAX_READ_WORKERS = 24  # I/O 并行数
 - **year-grain pool.map**: 30 年批量 map，减少进程调度开销
 - **自动空闲节点选择**: `get_climatology.sh` 自动 `sinfo` 查 idle 节点 + `--nodelist` 指定
 
-**Step 6 — float16 存储 + 节点优选（→ ~57s 冷启动）**
+**Step 6 — float16 存储 + 节点优选（→ ~45s 冷启动）**
 
 - CPU 存储从 float32（11.84 GB）→ float16（5.92 GB），pickle 序列化量减半
 - GPU 计算仍用 float32，精度无损
@@ -215,11 +215,11 @@ MAX_READ_WORKERS = 24  # I/O 并行数
 
 | 阶段 | 时间 | 占比 | 瓶颈 |
 |------|------|------|------|
-| Setup | 30-40s | ~60% | import torch + HIP 初始化（后台重叠） |
-| I/O | 31-49s | ~65% | 读 3060 个 .nc 文件（Lustre 共享存储，节点差异） |
-| Compute | 13-15s | ~23% | GPU topk P90 (4 卡并行) |
+| Setup | 24-40s | ~55% | import torch + HIP 初始化（后台重叠） |
+| I/O | 29-49s | ~65% | 读 3060 个 .nc 文件（Lustre 共享存储，节点差异） |
+| Compute | 13-14s | ~23% | GPU topk P90 (4 卡并行) |
 | Save | 1-2s | ~3% | 写 92 个 NetCDF |
-| **Total** | **46-66s (0.8-1.1 min)** | | |
+| **Total** | **45-66s (0.7-1.1 min)** | | |
 
 > Setup 和 I/O 后台线程重叠执行，wall time 取 max(Setup, I/O)。
 
@@ -237,7 +237,7 @@ MAX_READ_WORKERS = 24  # I/O 并行数
 | f32 4卡 线程并行 | 37s | 166s | ~2.8min | ~50x |
 | + netCDF4直读 + 重叠 | 29s | 114s | ~2.1min | ~50x |
 | + topk P90 + 去inode + 后台import | 18s | 55s | ~0.9min | ~60x |
-| **+ float16 + 节点优选** | **13s** | **~57s** | **~1.0min** | **~60x** |
+| **+ float16 + 节点优选** | **14s** | **~45s** | **~0.7min** | **~60x** |
 
 ---
 
