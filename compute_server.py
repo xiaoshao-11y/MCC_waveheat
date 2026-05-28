@@ -28,7 +28,6 @@ from collections import defaultdict
 from netCDF4 import Dataset
 import time
 import gc
-import threading
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -665,13 +664,12 @@ def build_bands():
 # ---------------------------------------------------------------------------
 
 def main():
-    total_start = time.time()
+    prep_start = time.time()
 
     # ---- File index ----
     print("Building file index ...")
     date_to_path = build_date_filepath_map()
     print(f"  Indexed {len(date_to_path)} files")
-    index_elapsed = time.time() - total_start
 
     # ---- Detect source format (int16 packed vs float32) ----
     fmt = detect_source_format(date_to_path)
@@ -706,7 +704,7 @@ def main():
     size_gb = N_YEARS * N_DAYS_PER_YEAR * N_LAT * N_LON * elem_bytes / 1024**3
     print(f"  Data array {shape} {packed_tag} ({size_gb:.2f} GB)")
 
-    # ---- Year-grain I/O + background torch import (teammate pipeline) ----
+    # ---- Year-grain I/O (netCDF4 + ProcessPoolExecutor) ----
     # Build year tasks with pre-resolved filepaths (no stat/isfile in workers)
     needed_dates = []
     for y in range(START_YEAR, END_YEAR + 1):
@@ -723,24 +721,10 @@ def main():
 
     print(f"\nReading {n_years} years ({len(needed_dates)} files) "
           f"grain=year workers={MAX_READ_WORKERS} ({packed_tag}) ...")
-    io_start = time.time()
+    total_start = time.time()
+
     data = np.full(shape, nan_fill, dtype=data_dtype)
 
-    # Pipeline: I/O via pool.map, torch import in background thread (teammate pattern)
-    setup_box = {"backend": None, "device": None, "time": 0.0}
-
-    def _setup_bg():
-        t0 = time.time()
-        print("[pipeline] pre-importing torch (parallel to I/O) ...")
-        b, d = _detect_backend()
-        setup_box["backend"] = b
-        setup_box["device"] = d
-        setup_box["time"] = time.time() - t0
-
-    setup_thread = threading.Thread(target=_setup_bg, name="setup")
-    setup_thread.start()
-
-    # I/O: pool.map with year-grain, pre-resolved paths (zero stat calls)
     executor = ProcessPoolExecutor(max_workers=MAX_READ_WORKERS)
     results = executor.map(read_one_year, year_tasks, chunksize=1)
     done_files = 0
@@ -752,18 +736,17 @@ def main():
         done_files += len(idx_list)
         if done_files % 510 == 0 or done_files >= len(needed_dates):
             print(f"  ... {done_files}/{len(needed_dates)} files "
-                  f"({time.time() - io_start:.1f}s)")
+                  f"({time.time() - total_start:.1f}s)")
     executor.shutdown()
 
-    # Wait for setup to finish
-    setup_thread.join()
-    backend = setup_box["backend"]
-    device = setup_box["device"]
-    setup_time = setup_box["time"]
+    io_elapsed = time.time() - total_start
+    print(f"  I/O: {io_elapsed:.1f}s")
 
-    io_elapsed = time.time() - io_start
-    print(f"  I/O+Setup wall: {io_elapsed:.1f}s  "
-          f"(Setup {setup_time:.0f}s overlapped with I/O)")
+    # ---- Backend detection ----
+    print(f"\nDetecting accelerator backend ...")
+    setup_start = time.time()
+    backend, device = _detect_backend()
+    setup_time = time.time() - setup_start
 
     # ---- Lat/lon coords (already read during format detection) ----
     lats = fmt["lats"]
@@ -861,29 +844,30 @@ def main():
     print(f"  NaN fraction (P90):  {np.isnan(threshold).mean()*100:.1f}%")
     print(f"  P90 > Climmean (mean): {np.nanmean(threshold) > np.nanmean(climatology)}")
 
+    prep_elapsed = total_start - prep_start
     total_elapsed = time.time() - total_start
-    serial_setup_io = setup_time + io_elapsed        # serial equivalent for comparison
-    accounted = index_elapsed + io_elapsed + compute_elapsed + save_elapsed
+    accounted = io_elapsed + setup_time + compute_elapsed + save_elapsed
     other = total_elapsed - accounted
 
     print(f"\n{'='*60}")
     print(f"  TIMING BREAKDOWN ({packed_tag})")
     print(f"{'='*60}")
-    print(f"  Index:      {index_elapsed:8.1f}s  ({index_elapsed/total_elapsed*100:5.1f}%)")
-    print(f"  Setup:      {setup_time:8.1f}s  ({setup_time/total_elapsed*100:5.1f}%)  ┐ overlapped")
-    print(f"  I/O:        {io_elapsed:8.1f}s  ({io_elapsed/total_elapsed*100:5.1f}%)  ┘ (wall)")
+    print(f"  Prep:       {prep_elapsed:8.1f}s          (file index + format probe)")
+    print(f"  I/O:        {io_elapsed:8.1f}s  ({io_elapsed/total_elapsed*100:5.1f}%)")
+    print(f"  Setup:      {setup_time:8.1f}s  ({setup_time/total_elapsed*100:5.1f}%)")
     print(f"  Compute:    {compute_elapsed:8.1f}s  ({compute_elapsed/total_elapsed*100:5.1f}%)")
     print(f"  Save:       {save_elapsed:8.1f}s  ({save_elapsed/total_elapsed*100:5.1f}%)")
     if other > 0.5:
         print(f"  Other:      {other:8.1f}s  ({other/total_elapsed*100:5.1f}%)")
     print(f"  {'─'*50}")
     print(f"  Total:      {total_elapsed:8.1f}s  ({total_elapsed/60:.1f} min)")
-    print(f"  (Serial Setup+I/O would be: {serial_setup_io:.0f}s, "
-          f"saved {setup_time:.0f}s by overlap)")
     print(f"{'='*60}")
 
+    real_no_setup = total_elapsed - setup_time
+    print(f"real {int(real_no_setup//60)}m{real_no_setup%60:.3f}s  (I/O+Compute+Save, no setup)")
     print("Done!")
 
 
 if __name__ == "__main__":
+    _wall_start = time.time()
     main()

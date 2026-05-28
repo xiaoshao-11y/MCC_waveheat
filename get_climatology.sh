@@ -45,14 +45,23 @@ if [ -z "${SLURM_JOB_ID}" ]; then
     echo ">> 空闲节点 (${IDLE_COUNT}个): $(echo ${IDLE_NODES} | tr '\n' ' ')"
 
     # f17* nodes: fast I/O but extremely slow torch import (~60s vs 20s)
-    # f16r4n02: slow I/O (~34s vs 26s)
-    # Strategy: prefer f16* nodes (balanced), exclude known-bad ones
-    GOOD_NODES=$(echo "${IDLE_NODES}" | grep "^f16")
-    if [ -z "${GOOD_NODES}" ]; then
-        echo ">> WARNING: No f16 nodes idle, falling back to all idle nodes..."
-        GOOD_NODES="${IDLE_NODES}"
+    # Node I/O ranking (24w): n13~13s, n03~14s, n12~15s >> n02~29s
+    # Strategy: f16r4n13 > f16r4n03 > f16r4n12 > f16* > fallback
+    PREFERRED=$(echo "${IDLE_NODES}" | grep "^f16r4n13$")
+    if [ -z "${PREFERRED}" ]; then
+        PREFERRED=$(echo "${IDLE_NODES}" | grep "^f16r4n03$")
     fi
-    SELECTED=$(echo "${GOOD_NODES}" | head -1)
+    if [ -z "${PREFERRED}" ]; then
+        PREFERRED=$(echo "${IDLE_NODES}" | grep "^f16r4n12$")
+    fi
+    if [ -z "${PREFERRED}" ]; then
+        PREFERRED=$(echo "${IDLE_NODES}" | grep "^f16")
+    fi
+    if [ -z "${PREFERRED}" ]; then
+        echo ">> WARNING: No f16 nodes idle, falling back to all idle nodes..."
+        PREFERRED="${IDLE_NODES}"
+    fi
+    SELECTED=$(echo "${PREFERRED}" | head -1)
     echo ">> 选中节点: ${SELECTED}"
     echo ""
 
