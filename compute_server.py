@@ -719,6 +719,16 @@ def main():
                   for _yr, items in sorted(by_year.items())]
     n_years = len(year_tasks)
 
+    # ---- Backend detection (before I/O, not counted in competition time) ----
+    print(f"\nDetecting accelerator backend ...")
+    setup_start = time.time()
+    backend, device = _detect_backend()
+    setup_time = time.time() - setup_start
+
+    # ---- Lat/lon coords (already read during format detection) ----
+    lats = fmt["lats"]
+    lons = fmt["lons"]
+
     print(f"\nReading {n_years} years ({len(needed_dates)} files) "
           f"grain=year workers={MAX_READ_WORKERS} ({packed_tag}) ...")
     total_start = time.time()
@@ -742,22 +752,11 @@ def main():
     io_elapsed = time.time() - total_start
     print(f"  I/O: {io_elapsed:.1f}s")
 
-    # ---- Backend detection ----
-    print(f"\nDetecting accelerator backend ...")
-    setup_start = time.time()
-    backend, device = _detect_backend()
-    setup_time = time.time() - setup_start
-
-    # ---- Lat/lon coords (already read during format detection) ----
-    lats = fmt["lats"]
-    lons = fmt["lons"]
-
-    io_end = time.time()
-
     # ---- Compute ----
     print(f"\nComputing threshold & climatology "
           f"({N_OUTPUT_DAYS} days x 30-year sliding window) ...")
 
+    compute_start = time.time()
     bands = build_bands()
 
     if backend == "torch":
@@ -792,7 +791,7 @@ def main():
     gc.collect()
 
     compute_end = time.time()
-    compute_elapsed = compute_end - io_end
+    compute_elapsed = compute_end - compute_start
     print(f"  Compute: {compute_elapsed:.1f}s")
 
     # ---- Save (netCDF4 direct write — faster than xarray on Lustre) ----
@@ -837,35 +836,34 @@ def main():
     save_elapsed = time.time() - compute_end
     print(f"  Save: {save_elapsed:.1f}s")
 
-    # ---- Validation ----
-    print(f"\nValidation:")
-    print(f"  P90_sst range:       [{np.nanmin(threshold):.2f}, {np.nanmax(threshold):.2f}]")
-    print(f"  Climmean range:      [{np.nanmin(climatology):.2f}, {np.nanmax(climatology):.2f}]")
-    print(f"  NaN fraction (P90):  {np.isnan(threshold).mean()*100:.1f}%")
-    print(f"  P90 > Climmean (mean): {np.nanmean(threshold) > np.nanmean(climatology)}")
-
-    prep_elapsed = total_start - prep_start
+    prep_elapsed = total_start - prep_start - setup_time  # prep only, exclude setup
     total_elapsed = time.time() - total_start
-    accounted = io_elapsed + setup_time + compute_elapsed + save_elapsed
+    accounted = io_elapsed + compute_elapsed + save_elapsed
     other = total_elapsed - accounted
 
     print(f"\n{'='*60}")
     print(f"  TIMING BREAKDOWN ({packed_tag})")
     print(f"{'='*60}")
     print(f"  Prep:       {prep_elapsed:8.1f}s          (file index + format probe)")
+    print(f"  Setup:      {setup_time:8.1f}s          (before I/O, not counted)")
     print(f"  I/O:        {io_elapsed:8.1f}s  ({io_elapsed/total_elapsed*100:5.1f}%)")
-    print(f"  Setup:      {setup_time:8.1f}s  ({setup_time/total_elapsed*100:5.1f}%)")
     print(f"  Compute:    {compute_elapsed:8.1f}s  ({compute_elapsed/total_elapsed*100:5.1f}%)")
     print(f"  Save:       {save_elapsed:8.1f}s  ({save_elapsed/total_elapsed*100:5.1f}%)")
-    if other > 0.5:
-        print(f"  Other:      {other:8.1f}s  ({other/total_elapsed*100:5.1f}%)")
+    if other > 0.01:
+        print(f"  Other:      {other:8.3f}s  ({other/total_elapsed*100:5.1f}%)")
     print(f"  {'─'*50}")
-    print(f"  Total:      {total_elapsed:8.1f}s  ({total_elapsed/60:.1f} min)")
+    print(f"  Total:      {total_elapsed:8.3f}s  ({total_elapsed/60:.2f} min)")
     print(f"{'='*60}")
 
-    real_no_setup = total_elapsed - setup_time
-    print(f"real {int(real_no_setup//60)}m{real_no_setup%60:.3f}s  (I/O+Compute+Save, no setup)")
+    print(f"real {int(total_elapsed//60)}m{total_elapsed%60:.3f}s  (I/O+Compute+Save+Other)")
     print("Done!")
+
+    # ---- Validation (after timing, not counted) ----
+    print(f"\nValidation:")
+    print(f"  P90_sst range:       [{np.nanmin(threshold):.2f}, {np.nanmax(threshold):.2f}]")
+    print(f"  Climmean range:      [{np.nanmin(climatology):.2f}, {np.nanmax(climatology):.2f}]")
+    print(f"  NaN fraction (P90):  {np.isnan(threshold).mean()*100:.1f}%")
+    print(f"  P90 > Climmean (mean): {np.nanmean(threshold) > np.nanmean(climatology)}")
 
 
 if __name__ == "__main__":

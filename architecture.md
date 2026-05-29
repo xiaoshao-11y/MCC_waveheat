@@ -45,24 +45,25 @@ sdp/
        │
        ▼
   ┌────────────────────────────────────┐
+  │  Setup: backend 检测                │  ← _detect_backend(), import torch
+  │  PyTorch ROCm/DCU → 4 GPUs         │    ~14s (不计入比赛时间)
+  └────────────────────────────────────┘
+       │
+       ▼  ─── total_start (计时起点) ───
+       │
+  ┌────────────────────────────────────┐
   │  并行 I/O (24 process workers)      │  ← ProcessPoolExecutor, year-grain pool.map
   │  netCDF4 直读 read_one_year() × 30 │    预建路径零 stat, 无 inode 排序
-  │  float16 存储 (5.92 GB)             │    ~14s (好节点) ~29s (慢节点)
+  │  float16 存储 (5.92 GB)             │    ~15s (好节点) ~29s (慢节点)
   └────────────────────────────────────┘
        │
        ▼  data: (30, 102, 721, 1440) float16
        │
   ┌────────────────────────────────────┐
-  │  Setup: backend 检测                │  ← _detect_backend(), import torch
-  │  PyTorch ROCm/DCU → 4 GPUs         │    ~12-14s
-  └────────────────────────────────────┘
-       │
-       ▼
-  ┌────────────────────────────────────┐
   │  Compute: _compute_torch_multi_gpu  │  ← 4 卡线程并行
   │  15 bands ÷ 4 GPUs                  │
   │  每 band 分 23天/批                  │
-  │  topk P90 + inference_mode          │    ~13s
+  │  topk P90 + inference_mode          │    ~14s
   │  线程共享 data_np 零拷贝             │
   └────────────────────────────────────┘
        │
@@ -72,11 +73,16 @@ sdp/
   │  Save: 92 个 .nc 文件               │  ← netCDF4 Dataset, float32
   │  Climatology/MMDD.nc                │    ~1.5s
   └────────────────────────────────────┘
+       │
+       ▼
+  ┌────────────────────────────────────┐
+  │  Validation (计时后)                 │  ← nanmin/nanmax/isnan 检查
+  └────────────────────────────────────┘
 ```
 
-**执行顺序**：Prep → I/O → Setup → Compute → Save（全部串行）
+**执行顺序**：Prep → Setup → I/O → Compute → Save → Validation
 
-计时起点在 I/O 开始处，`real = I/O + Compute + Save` ≈ 29s（不含 Setup）。
+计时起点在 I/O 开始处（`total_start`），Setup 在计时起点之前，Validation 在计时终点之后。`real = I/O + Compute + Save + Other` ≈ 32s。
 
 ### 计时架构
 
@@ -87,18 +93,18 @@ sdp/
 │ │ Python import (~5s)                       │ │
 │ │ ┌──────────────────────────────────────┐ │ │
 │ │ │ main()                                │ │ │
-│ │ │   Prep (0.1s)                        │ │ │
+│ │ │   Prep   (0.1s)  ← 不计时            │ │ │
+│ │ │   Setup (14s)   ← 不计时             │ │ │
 │ │ │   ─── total_start ───                │ │ │
-│ │ │   I/O    (14s)                       │ │ │
-│ │ │   Setup  (12s)  ← 不计入 real        │ │ │
-│ │ │   Compute(13s)                       │ │ │
+│ │ │   I/O    (15s)                       │ │ │
+│ │ │   Compute(14s)                       │ │ │
 │ │ │   Save   (1.5s)                      │ │ │
-│ │ │   ─── real = Total - Setup ───       │ │ │
-│ │ │   Total:  ~41s                       │ │ │
-│ │ │   real:   ~29s  (不含 Setup)          │ │ │
+│ │ │   ─── total_elapsed ───              │ │ │
+│ │ │   Total:  ~32s  (比赛计时)            │ │ │
+│ │ │   Validation  (0.4s) ← 不计时        │ │ │
 │ │ └──────────────────────────────────────┘ │ │
 │ └──────────────────────────────────────────┘ │
-│ Shell real: ~47s (含 import + setup)         │
+│ Shell real: ~51s (含 import + prep + setup)  │
 └──────────────────────────────────────────────┘
 ```
 
@@ -235,23 +241,27 @@ HDF5 全局锁串行化多线程 I/O，反而更慢（51s）。
 
 **Step 8 — 计时修正 + 节点排名**
 
-- 去掉 Setup/I/O 并行，改为串行 I/O → Setup → Compute → Save
-- real 计时不含 Setup（赛题：环境加载不计时）
+- Setup 串行在 I/O → Compute → Save 中间，real 不含 Setup（赛题：环境加载不计时）
 - 实测节点排名：f16r4n13 > f16r4n03 > f16r4n12
 - I/O 从 29s → 14s（节点差异，同一集群差 2 倍）
+
+**Step 9 — Setup 前置 + Validation 后置**
+
+- Setup 移到 I/O 之前，`total_start` 在 Setup 之后，纯净计时
+- Validation 移到 `Done!` 之后，不计入比赛时间
+- Shell real 从 ~47s → ~51s（受 import 和节点影响），比赛计时 ~32s
 
 ### 最终性能（冷启动，最佳节点 f16r4n13）
 
 | 阶段 | 时间 | 说明 |
 |------|------|------|
-| Prep | 0.1s | 文件索引 + 格式探测 |
-| I/O | 14s | 3060 文件, 5.92 GB, 24 workers |
-| Setup | 12s | import torch + HIP 初始化 |
-| Compute | 13s | 4×DCU Z200, topk P90 |
+| Prep | 0.2s | 文件索引 + 格式探测（不计时） |
+| Setup | 14s | import torch + HIP 初始化（不计时） |
+| I/O | 15s | 3060 文件, 5.92 GB, 24 workers |
+| Compute | 14s | 4×DCU Z200, topk P90 |
 | Save | 1.5s | 92 个 NetCDF |
-| **Total** | **41s** | 从 I/O 开始 |
-| **real** | **~29s** | I/O+Compute+Save（不含 Setup） |
-| **Shell real** | **~47s** | 完整进程 |
+| **Total** | **~32s** | I/O+Compute+Save+Other（比赛计时） |
+| **Shell real** | **~51s** | 完整进程（含 import + prep + setup） |
 
 > 相比原始逐像素 CPU 循环的数小时，累计加速约 **60 倍**。
 
@@ -259,7 +269,7 @@ HDF5 全局锁串行化多线程 I/O，反而更慢（51s）。
 
 ## 性能演进
 
-| 版本 | Compute | real (no setup) | Shell real | 加速 |
+| 版本 | Compute | real (比赛计时) | Shell real | 加速 |
 |------|---------|-----------------|------------|------|
 | 逐像素 CPU (原始) | 数小时 | — | 数小时 | 1x |
 | f64 GPU 向量化 | ~200s | — | ~6.6min | ~20x |
@@ -268,7 +278,8 @@ HDF5 全局锁串行化多线程 I/O，反而更慢（51s）。
 | + netCDF4直读 + 重叠 | 29s | — | ~2.1min | ~50x |
 | + topk P90 + 去inode + 后台import | 18s | — | ~0.9min | ~60x |
 | + float16 + 节点优选 | 14s | ~45s | ~0.7min | ~60x |
-| **+ 计时修正 + 节点排名** | **13s** | **~29s** | **~47s** | **~60x** |
+| + 计时修正 + 节点排名 | 13s | ~29s | ~47s | ~60x |
+| **+ Setup前置 + Validation后置** | **14s** | **~32s** | **~51s** | **~60x** |
 
 ---
 
