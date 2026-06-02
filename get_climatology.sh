@@ -78,6 +78,12 @@ echo ">>> 作业 ID: ${SLURM_JOB_ID}"
 # Disable core dumps (prevents massive files from segfaults on bad nodes)
 ulimit -c 0 2>/dev/null || true
 
+# Clean /dev/shm from previous jobs (critical for MPI UCX shared memory)
+find /dev/shm -maxdepth 1 -user "$(id -un)" -delete 2>/dev/null || true
+# Fallback: tell UCX to use /tmp if /dev/shm is full
+export UCX_TMP_DIR="${TMPDIR:-/tmp}"
+export UCX_MEMTYPE_CACHE=n
+
 # ---- Speed up Python imports: cache .pyc on local SSD, not Lustre ----
 # Try /tmp first, fall back if full
 if mkdir -p /tmp/pycache 2>/dev/null && [ -w /tmp/pycache ]; then
@@ -98,6 +104,13 @@ export ROCM_PATH=${ROCM_PATH:-/public/software/compiler/rocm/dtk-24.04}
 export HIP_VISIBLE_DEVICES=0,1,2,3
 export MAX_READ_WORKERS=24
 
+# ---- MPI mode (set USE_MPI=1 before calling this script) ----
+USE_MPI="${USE_MPI:-0}"
+MPI_NP="${MPI_NP:-30}"
+
+# ---- PyTorch HIP alloc conf (ROCm memory tuning) ----
+export PYTORCH_HIP_ALLOC_CONF="${PYTORCH_HIP_ALLOC_CONF:-max_split_size_mb:256,garbage_collection_threshold:0.8}"
+
 mkdir -p /public/home/pan2174/sdp/ERA5/Climatology /public/home/pan2174/sdp/logs
 
 # ---- Locate Python directly (skip slow conda activate) ----
@@ -105,4 +118,18 @@ CONDA_ENV=/public/home/pan2174/install/miniconda3/envs/waveheat
 export PATH="${CONDA_ENV}/bin:${PATH}"
 export LD_LIBRARY_PATH="${CONDA_ENV}/lib:${LD_LIBRARY_PATH}"
 
-{ time python /public/home/pan2174/sdp/compute_server.py; } 2>&1
+if [ "${USE_MPI}" = "1" ]; then
+    # ---- Intel MPI / ROMIO tuning for Lustre ----
+    export ROMIO_CB_READ=enable
+    export ROMIO_DS_READ=enable
+    export CB_BUFFER_SIZE=4194304
+
+    # Load Intel MPI module (already loaded by ls/run_climatology.sh:35)
+    module load mpi/hpcx/2.7.4/gcc-7.3.1 2>/dev/null || true
+
+    echo ">>> MPI mode: mpirun -np ${MPI_NP}"
+    { time mpirun -np "${MPI_NP}" python /public/home/pan2174/sdp/compute_server_mpi.py; } 2>&1
+else
+    echo ">>> ProcessPool mode: MAX_READ_WORKERS=${MAX_READ_WORKERS}"
+    { time python /public/home/pan2174/sdp/compute_server.py; } 2>&1
+fi

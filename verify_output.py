@@ -11,43 +11,41 @@ SAVE_PATH       = Path(__file__).resolve().parent / "verification"
 
 SAVE_PATH.mkdir(parents=True, exist_ok=True)
 
-rmse_clim = np.full(92, np.nan)
-rmse_P90  = np.full(92, np.nan)
-day_index = 0
-
 import xarray as xr
 
-days_in_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+# Collect all .nc files from output dir, match with reference
+our_files = sorted(OUR_CLIM_PATH.glob("*.nc"))
+if not our_files:
+    print("ERROR: No output files found!")
+    exit(1)
 
-for month in (6, 7, 8):
-    for day in range(1, days_in_month[month - 1] + 1):
-        fname = f"{month:02d}{day:02d}.nc"
+n_files = len(our_files)
+rmse_clim = np.full(n_files, np.nan)
+rmse_P90  = np.full(n_files, np.nan)
 
-        ref_file = REF_CLIM_PATH / fname
-        our_file = OUR_CLIM_PATH / fname
+for day_index, our_file in enumerate(our_files):
+    fname = our_file.name
+    ref_file = REF_CLIM_PATH / fname
 
-        if not ref_file.exists():
-            print(f"  WARNING: 参考文件不存在: {ref_file}")
-            day_index += 1
-            continue
-        if not our_file.exists():
-            print(f"  WARNING: 输出文件不存在: {our_file}")
-            day_index += 1
-            continue
+    if not ref_file.exists():
+        print(f"  WARNING: 参考文件不存在: {ref_file}")
+        continue
+    if not our_file.exists():
+        print(f"  WARNING: 输出文件不存在: {our_file}")
+        continue
 
-        print(f"  读取: {fname}")
+    print(f"  读取: {fname}")
 
-        ref_ds = xr.open_dataset(ref_file)
-        our_ds = xr.open_dataset(our_file)
+    ref_ds = xr.open_dataset(ref_file)
+    our_ds = xr.open_dataset(our_file)
 
-        rmse_clim[day_index] = np.sqrt(
-            np.nanmean((ref_ds["Climmean"].values - our_ds["Climmean"].values) ** 2))
-        rmse_P90[day_index] = np.sqrt(
-            np.nanmean((ref_ds["P90_sst"].values - our_ds["P90_sst"].values) ** 2))
+    rmse_clim[day_index] = np.sqrt(
+        np.nanmean((ref_ds["Climmean"].values - our_ds["Climmean"].values) ** 2))
+    rmse_P90[day_index] = np.sqrt(
+        np.nanmean((ref_ds["P90_sst"].values - our_ds["P90_sst"].values) ** 2))
 
-        ref_ds.close()
-        our_ds.close()
-        day_index += 1
+    ref_ds.close()
+    our_ds.close()
 
 R_clim   = np.nanmean(rmse_clim)
 R_P90    = np.nanmean(rmse_P90)
