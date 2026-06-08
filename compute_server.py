@@ -49,11 +49,10 @@ WINDOW_SIZE = 2 * WINDOW_HALF + 1
 
 N_LAT = 721
 N_LON = 1440
-N_DAYS_PER_YEAR = 102
-N_OUTPUT_DAYS = N_DAYS_PER_YEAR - WINDOW_SIZE + 1           # e.g. 102-11+1=92 (WH=5)
+N_DAYS_PER_YEAR = 98
+N_OUTPUT_DAYS = N_DAYS_PER_YEAR - WINDOW_SIZE + 1           # e.g. 98-11+1=88 (WH=5)
 
-# Date range covering all windows: DOY 147–248 in 365-day calendar
-# → May 27 to Sep 5 in natural calendar (102 days)
+# Date range covering all windows: 5/29 to 9/3 (98 days)
 DATE_START_MMDD = (5, 27)
 DATE_END_MMDD = (9, 5)
 

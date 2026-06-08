@@ -54,7 +54,7 @@ DATE_START_MMDD = (5, 27)
 DATE_END_MMDD = (9, 5)
 
 N_BANDS = int(os.environ.get("N_BANDS", "24"))
-SUB_BATCH_DAYS = int(os.environ.get("SUB_BATCH_DAYS", "23"))
+SUB_BATCH_DAYS = int(os.environ.get("SUB_BATCH_DAYS", "46"))
 IO_THREADS = int(os.environ.get("IO_THREADS", "4"))
 
 VAR_SST = "data"
@@ -403,12 +403,6 @@ def _compute_torch_band(data_np, device, bands, packed=False,
                         scale_factor=None, add_offset=None, fill_value=None):
     import torch
 
-    # Warmup float16 — matches actual compute path
-    warmup = torch.randn(10, 300, 10, 100, device=device, dtype=torch.float16)
-    _p90_fast_torch(warmup, dim=1)
-    torch.nanmean(warmup, dim=1)
-    del warmup
-
     threshold = np.full((N_OUTPUT_DAYS, N_LAT, N_LON), np.nan, dtype=np.float32)
     climatology = np.full((N_OUTPUT_DAYS, N_LAT, N_LON), np.nan, dtype=np.float32)
 
@@ -416,7 +410,7 @@ def _compute_torch_band(data_np, device, bands, packed=False,
         t0 = time.time()
         band_rows = r1 - r0
 
-        band_t = torch.from_numpy(data_np[:, :, r0:r1, :]).to(device)
+        band_t = torch.from_numpy(data_np[:, :, r0:r1, :].copy()).to(device)
 
         if packed:
             band_t = band_t.to(torch.float32)
@@ -445,6 +439,7 @@ def _compute_torch_band(data_np, device, bands, packed=False,
                 del sub, sub_thresh, sub_clim
 
         del band_t, windows_view
+        torch.cuda.empty_cache()
 
         elapsed = time.time() - t0
         print(f"  Band {band_idx+1}/{len(bands)} rows [{r0}:{r1}] done ({elapsed:.1f}s)")
@@ -471,25 +466,13 @@ def _compute_torch_multi_gpu(data_np, num_gpus, bands, packed=False,
     def _thread_worker(gpu_id, group):
         torch.cuda.set_device(gpu_id)
 
-        # Warmup float16 — matches actual compute path
-        warmup = torch.randn(10, 300, 10, 100, device=gpu_id, dtype=torch.float16)
-        _p90_fast_torch(warmup, dim=1)
-        torch.nanmean(warmup, dim=1)
-        del warmup
-
         for r0, r1 in group:
             t0 = time.time()
-            band_rows = r1 - r0
 
-            # No .copy() — slice is contiguous, torch.from_numpy zero-copies
-            band_t = torch.from_numpy(data_np[:, :, r0:r1, :]).to(gpu_id)
-
-            if packed:
-                band_t = band_t.to(torch.float32)
-                mask = band_t == fill_value
-                band_t.mul_(scale_factor).add_(add_offset)
-                band_t[mask] = float('nan')
-
+            # Transfer compact band to GPU (504 MiB per band) and expand there.
+            # GPU HBM2 bandwidth (~1 TB/s) >> PCIe (~16 GB/s), so compact
+            # transfer + GPU-side unfold/permute/reshape beats CPU pre-build.
+            band_t = torch.from_numpy(data_np[:, :, r0:r1, :].copy()).to(gpu_id)
             windows_view = band_t.unfold(dimension=1, size=WINDOW_SIZE, step=1)
 
             with torch.inference_mode():
@@ -497,19 +480,27 @@ def _compute_torch_multi_gpu(data_np, num_gpus, bands, packed=False,
                     d1 = min(d0 + SUB_BATCH_DAYS, N_OUTPUT_DAYS)
                     n_days = d1 - d0
 
-                    sub = windows_view[:, d0:d1, :, :, :]
-                    sub = sub.permute(1, 0, 4, 2, 3).reshape(
-                        n_days, N_YEARS * WINDOW_SIZE, band_rows, N_LON)
+                    sub = windows_view[:, d0:d1].permute(1, 0, 4, 2, 3).reshape(
+                        n_days, N_YEARS * WINDOW_SIZE, r1 - r0, N_LON)
+
+                    if packed:
+                        sub = sub.to(torch.float32)
+                        mask = sub == fill_value
+                        sub.mul_(scale_factor).add_(add_offset)
+                        sub[mask] = float('nan')
 
                     sub_thresh = _p90_fast_torch(sub, dim=1)
                     sub_clim = torch.nanmean(sub, dim=1)
 
-                    threshold[d0:d1, r0:r1, :] = sub_thresh.cpu().numpy().astype(np.float32)
-                    climatology[d0:d1, r0:r1, :] = sub_clim.cpu().numpy().astype(np.float32)
+                    threshold[d0:d1, r0:r1, :] = \
+                        sub_thresh.cpu().numpy().astype(np.float32)
+                    climatology[d0:d1, r0:r1, :] = \
+                        sub_clim.cpu().numpy().astype(np.float32)
 
                     del sub, sub_thresh, sub_clim
 
             del band_t, windows_view
+            torch.cuda.empty_cache()
 
             elapsed = time.time() - t0
             print(f"  [GPU {gpu_id}] Band rows [{r0}:{r1}] done ({elapsed:.1f}s)")
@@ -789,28 +780,35 @@ def main():
     lats = fmt["lats"]
     lons = fmt["lons"]
 
-    # ---- MPI Distributed I/O ----
+    # ---- MPI Distributed I/O (direct-to-shared-memory, no gather step) ----
+    # Allocate MPI shared memory BEFORE reading — each rank writes directly
+    # to data[yr_idx, day_idx], eliminating the intermediate local_data +
+    # separate gather copy (~2s savings).
+    total_bytes = shape[0] * shape[1] * shape[2] * shape[3] * elem_bytes
+    win_size = total_bytes if rank == 0 else 0
+    win = MPI.Win.Allocate_shared(win_size, 1, comm=comm)
+    shm_mem, _ = win.Shared_query(0)
+    data = np.ndarray(shape, dtype=data_dtype, buffer=shm_mem)
+
     if rank == 0:
         io_label = f"{IO_THREADS} threads" if IO_THREADS > 1 else "1 thread"
         print(f"\nReading {n_my_years} years per rank "
               f"(MPI distributed, {packed_tag}"
-              f"{', raw I/O' if raw_info else ', netCDF4'}, {io_label}) ...")
+              f"{', raw I/O' if raw_info else ', netCDF4'}, {io_label}, "
+              f"direct-to-shm) ...")
     comm.Barrier()
     io_start = time.time()
 
-    # Each rank reads its own years — no pickle, no inter-process communication
-    local_data = np.full((n_my_years, N_DAYS_PER_YEAR, N_LAT, N_LON),
-                         nan_fill, dtype=data_dtype)
-
-    # Flatten all (year_idx, idx_slot, fp) for this rank
+    # Flatten all (year_idx, idx_slot, fp) — year_idx maps directly into data
     all_items = []
-    for i, year in enumerate(my_years):
+    for year in my_years:
+        yr_idx = int(year) - START_YEAR
         for idx_slot, fp in by_year[year]:
-            all_items.append((i, idx_slot, fp))
+            all_items.append((yr_idx, idx_slot, fp))
 
     def _read_chunk(items_chunk):
-        """Read a chunk of files and write directly into local_data."""
-        for yr_i, idx_slot, fp in items_chunk:
+        """Read files and write directly into shared data array (no local_data)."""
+        for yr_idx, idx_slot, fp in items_chunk:
             if raw_info is not None:
                 block = raw_read_sst(fp, raw_info)
             else:
@@ -820,7 +818,7 @@ def main():
             if block.shape != (N_LAT, N_LON):
                 block = block.T
             day_idx = idx_slot % N_DAYS_PER_YEAR
-            local_data[yr_i, day_idx] = np.asarray(block, dtype=data_dtype)
+            data[yr_idx, day_idx] = np.asarray(block, dtype=data_dtype)
 
     n_items = len(all_items)
     if IO_THREADS > 1 and n_items > IO_THREADS:
@@ -837,39 +835,11 @@ def main():
     else:
         _read_chunk(all_items)
 
-    if rank == 0:
-        print(f"  Rank 0 local read done ({time.time() - io_start:.1f}s)")
-
+    # Barrier ensures all writes from all ranks complete before rank 0 reads
     comm.Barrier()
-    io_read_done = time.time()
-    if rank == 0:
-        print(f"  All ranks read done ({io_read_done - io_start:.1f}s)")
-
-    # ---- Gather data to rank 0 via MPI shared memory (zero-copy) ----
-    # On a single node, MPI_Win_allocate_shared creates RAM shared by all ranks.
-    # Each rank writes directly into rank 0's section — no message passing.
-    total_bytes = shape[0] * shape[1] * shape[2] * shape[3] * elem_bytes
-    win_size = total_bytes if rank == 0 else 0
-    win = MPI.Win.Allocate_shared(win_size, 1, comm=comm)
-    shm_mem, _ = win.Shared_query(0)
-    data = np.ndarray(shape, dtype=data_dtype, buffer=shm_mem)
-
-    # Each rank writes its years directly into the shared data array
-    for i, year in enumerate(my_years):
-        yr_idx = int(year) - START_YEAR
-        data[yr_idx] = local_data[i]
-
-    del local_data
-    gc.collect()
-
-    # Barrier ensures all writes complete before rank 0 reads
-    comm.Barrier()
-    gather_elapsed = time.time() - io_read_done
-
     io_elapsed = time.time() - io_start
     if rank == 0:
-        print(f"  MPI I/O total: {io_elapsed:.1f}s "
-              f"(read {io_read_done - io_start:.1f}s + gather {gather_elapsed:.1f}s)")
+        print(f"  MPI I/O total: {io_elapsed:.1f}s (no gather — direct to shm)")
 
     # ---- Only rank 0 does compute and save ----
     if rank != 0:
