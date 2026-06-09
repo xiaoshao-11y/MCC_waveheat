@@ -1,14 +1,11 @@
 #!/usr/bin/env python
-"""compute_server_mpi.py — MPI distributed I/O version.
+"""compute_server_mpi.py — MPI distributed I/O + PyTorch ROCm multi-GPU compute.
 
-Replaces ProcessPoolExecutor with mpi4py + Intel MPI:
-  - 30 MPI ranks, each reads 1 year (102 files) independently
-  - No pickle serialization — data stays as numpy arrays
-  - Isend/Irecv to rank 0 (shared memory on single node)
-  - Rank 0 executes GPU computation (same as compute_server.py)
+MPI (30 ranks): raw byte I/O → direct-to-shm → rank 0 GPU compute.
+4×DCU Z200 parallel: unfold + topk P90 + nanmean, float16 throughout.
 
 Usage:
-  mpirun -np 30 python compute_server_mpi.py
+  N_BANDS=12 SUB_BATCH_DAYS=46 USE_MPI=1 bash get_climatology.sh
 """
 
 import numpy as np
@@ -18,74 +15,50 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from collections import defaultdict
 from netCDF4 import Dataset
-try:
-    import h5py
-    _HAS_H5PY = True
-except ImportError:
-    _HAS_H5PY = False
 import time
 import gc
 from concurrent.futures import ThreadPoolExecutor
 from mpi4py import MPI
 
+try:
+    import h5py
+    _HAS_H5PY = True
+except ImportError:
+    _HAS_H5PY = False
+
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 size = comm.Get_size()
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+# ── Configuration ──────────────────────────────────────────────────────────
+
 DATA_DIR = Path("/public/home/achwjznh4b/Newdata/")
 OUT_DIR = Path(__file__).resolve().parent / "ERA5" / "Climatology"
 
-START_YEAR = 1991
-END_YEAR = 2020
-N_YEARS = END_YEAR - START_YEAR + 1                       # 30
+START_YEAR, END_YEAR = 1991, 2020
+N_YEARS = END_YEAR - START_YEAR + 1                     # 30
 
 WINDOW_HALF = int(os.environ.get("WINDOW_HALF", "5"))
-WINDOW_SIZE = 2 * WINDOW_HALF + 1
+WINDOW_SIZE = 2 * WINDOW_HALF + 1                       # 11
 
-N_LAT = 721
-N_LON = 1440
-N_DAYS_PER_YEAR = 102
-N_OUTPUT_DAYS = N_DAYS_PER_YEAR - WINDOW_SIZE + 1           # e.g. 102-11+1=92 (WH=5)
+N_LAT, N_LON = 721, 1440
+N_DAYS_PER_YEAR = 102                                   # May 27 – Sep 5
+N_OUTPUT_DAYS = N_DAYS_PER_YEAR - WINDOW_SIZE + 1       # 92 (Jun 1 – Aug 31)
 
-DATE_START_MMDD = (5, 27)
-DATE_END_MMDD = (9, 5)
+DATE_START = (5, 27)
+DATE_END = (9, 5)
 
-N_BANDS = int(os.environ.get("N_BANDS", "24"))
+N_BANDS = int(os.environ.get("N_BANDS", "12"))
 SUB_BATCH_DAYS = int(os.environ.get("SUB_BATCH_DAYS", "46"))
 IO_THREADS = int(os.environ.get("IO_THREADS", "4"))
 
-VAR_SST = "data"
-VAR_LAT = "lat"
-VAR_LON = "lon"
 
-
-# ---------------------------------------------------------------------------
-# 365-day calendar helpers (matches compute_server.py exactly)
-# ---------------------------------------------------------------------------
-
-def is_leap_year(yr):
-    return (yr % 4 == 0 and yr % 100 != 0) or (yr % 400 == 0)
-
-
-def build_365_calendar(year):
-    d0 = datetime(year, 1, 1)
-    if is_leap_year(year):
-        dates = []
-        for offset in range(366):
-            d = d0 + timedelta(days=offset)
-            if not (d.month == 2 and d.day == 29):
-                dates.append(d)
-    else:
-        dates = [d0 + timedelta(days=i) for i in range(365)]
-    return dates
-
+# ── Calendar helpers ───────────────────────────────────────────────────────
 
 def get_date_strings_for_year(year):
-    start = datetime(year, *DATE_START_MMDD)
-    end = datetime(year, *DATE_END_MMDD)
+    """Return YYYYMMDD strings for May 27 – Sep 5 of a given year."""
+    start = datetime(year, *DATE_START)
+    end = datetime(year, *DATE_END)
     dates = []
     current = start
     while current <= end:
@@ -95,290 +68,153 @@ def get_date_strings_for_year(year):
 
 
 def build_date_filepath_map():
-    date_to_path = {}
-    for fp in DATA_DIR.iterdir():
-        name = fp.name
-        if len(name) == 8 and name.isdigit():
-            date_to_path[name] = str(fp)
-    return date_to_path
+    """Glob DATA_DIR once → {YYYYMMDD: path} dict. Zero stat calls in I/O loop."""
+    return {fp.name: str(fp) for fp in DATA_DIR.iterdir()
+            if len(fp.name) == 8 and fp.name.isdigit()}
 
 
-# ---------------------------------------------------------------------------
-# Raw byte I/O: bypass HDF5 parsing, read float64 bytes directly from disk
-# ---------------------------------------------------------------------------
+# ── Raw byte I/O ───────────────────────────────────────────────────────────
 
-def _probe_raw_read(sample_path, sst_var, date_to_path):
-    """Check if source NetCDF4/HDF5 files support raw byte reading.
+def _probe_raw_read(date_to_path):
+    """Check if source files support raw seek+read (contiguous, uncompressed).
 
     Returns dict(offset, dtype, shape, nbytes) or None.
-    Raw read works only when the dataset is contiguous and uncompressed
-    with a consistent byte offset across all files.
     """
     if not _HAS_H5PY:
         if rank == 0:
             print("    Raw I/O:         DISABLED (h5py not available)")
         return None
 
-    # Pick 3 files from different months to verify consistency
-    dates = sorted(date_to_path.keys())
-    test_paths = []
-    for ds in dates:
-        fp = date_to_path[ds]
-        if fp:
-            test_paths.append(fp)
-        if len(test_paths) >= 3:
-            break
-
-    offsets = []
-    _dtype = None
-    _shape = None
+    # Verify consistency across 3 sample files
+    test_paths = [date_to_path[ds] for ds in sorted(date_to_path)[:3]
+                  if date_to_path.get(ds)]
+    offsets, dtype, shape = [], None, None
     for fp in test_paths:
         try:
             with h5py.File(fp, "r") as f:
-                ds_obj = f[sst_var]
-                if ds_obj.chunks is not None:
+                ds = f["data"]
+                if ds.chunks is not None:
                     if rank == 0:
-                        print(f"    Raw I/O:         DISABLED (chunked dataset: {ds_obj.chunks})")
+                        print(f"    Raw I/O:         DISABLED (chunked: {ds.chunks})")
                     return None
-                if ds_obj.compression:
+                if ds.compression:
                     if rank == 0:
-                        print(f"    Raw I/O:         DISABLED (compressed: {ds_obj.compression})")
+                        print(f"    Raw I/O:         DISABLED (compressed)")
                     return None
-                off = ds_obj.id.get_offset()
+                off = ds.id.get_offset()
                 if off is None:
                     if rank == 0:
-                        print("    Raw I/O:         DISABLED (no byte offset available)")
+                        print("    Raw I/O:         DISABLED (no byte offset)")
                     return None
                 offsets.append(off)
-                _dtype = ds_obj.dtype
-                _shape = ds_obj.shape
+                dtype, shape = ds.dtype, ds.shape
         except Exception as e:
             if rank == 0:
-                print(f"    Raw I/O:         DISABLED (h5py probe error: {e})")
+                print(f"    Raw I/O:         DISABLED (probe error: {e})")
             return None
 
     if len(set(offsets)) != 1:
         if rank == 0:
-            print(f"    Raw I/O:         DISABLED (inconsistent offsets: {set(offsets)})")
+            print(f"    Raw I/O:         DISABLED (inconsistent offsets)")
         return None
 
-    nbytes = int(np.prod(_shape)) * _dtype.itemsize
+    nbytes = int(np.prod(shape)) * dtype.itemsize
 
+    # Validate: raw read must match h5py read
     try:
         with h5py.File(test_paths[0], "r") as f:
-            ref = f[sst_var][:]
+            ref = f["data"][:]
         with open(test_paths[0], "rb") as f:
             f.seek(offsets[0])
             raw = f.read(nbytes)
-        # Try both native and byteswapped byte orders
-        test_native = np.frombuffer(raw, dtype=_dtype).reshape(_shape)
-        if np.array_equal(ref, test_native, equal_nan=True):
-            return {"offset": offsets[0], "dtype": _dtype, "shape": _shape, "nbytes": nbytes}
-
-        test_swapped = np.frombuffer(raw, dtype=_dtype.newbyteorder()).reshape(_shape)
-        if np.array_equal(ref, test_swapped, equal_nan=True):
-            if rank == 0:
-                print(f"    Raw I/O:         ENABLED (offset={offsets[0]}, "
-                      f"{nbytes} bytes, byteswapped read)")
-            return {"offset": offsets[0], "dtype": _dtype.newbyteorder(),
-                    "shape": _shape, "nbytes": nbytes}
-
+        for dt in (dtype, dtype.newbyteorder()):
+            test = np.frombuffer(raw, dtype=dt).reshape(shape)
+            if np.array_equal(ref, test, equal_nan=True):
+                if rank == 0:
+                    print(f"    Raw I/O:         ENABLED (offset={offsets[0]}, "
+                          f"{nbytes} bytes, direct seek+read)")
+                return {"offset": offsets[0], "dtype": dt, "shape": shape, "nbytes": nbytes}
         if rank == 0:
-            max_diff = np.nanmax(np.abs(ref.astype(float) - test_native.astype(float)))
-            print(f"    Raw I/O:         DISABLED (mismatch: max_diff={max_diff:.6f}, "
-                  f"ref[:2,:2]={ref[:2,:2].tolist()}, "
-                  f"raw[:2,:2]={test_native[:2,:2].tolist()})")
-            return None
+            print("    Raw I/O:         DISABLED (validation mismatch)")
     except Exception as e:
         if rank == 0:
             print(f"    Raw I/O:         DISABLED (validation error: {e})")
-        return None
-
-    return {"offset": offsets[0], "dtype": _dtype, "shape": _shape, "nbytes": nbytes}
+    return None
 
 
 def raw_read_sst(fp, raw_info):
-    """Read SST data using raw seek+read — bypasses HDF5 parsing entirely."""
+    """Read one SST file via raw seek+read — bypasses HDF5/netCDF4 entirely."""
     with open(fp, "rb") as f:
         f.seek(raw_info["offset"])
         raw = f.read(raw_info["nbytes"])
     return np.frombuffer(raw, dtype=raw_info["dtype"]).reshape(raw_info["shape"])
 
 
-# ---------------------------------------------------------------------------
-# Source format detection (rank 0 only → broadcast results)
-# ---------------------------------------------------------------------------
+# ── Source format detection ────────────────────────────────────────────────
 
 def detect_source_format(date_to_path):
-    sample_path = None
-    for date_str in sorted(date_to_path.keys()):
-        fp = date_to_path[date_str]
-        if fp:
-            sample_path = fp
-            break
-
-    _default = {"packed": False, "scale_factor": 0.0, "add_offset": 0.0,
-                 "fill_value": None, "sst_var": VAR_SST, "dtype": "float32",
-                 "lats": None, "lons": None, "sample_path": None}
-
-    if sample_path is None:
+    """Probe first available file for SST var name, lat/lon, and raw I/O info."""
+    sample = next((date_to_path[ds] for ds in sorted(date_to_path)
+                   if date_to_path.get(ds)), None)
+    if sample is None:
         if rank == 0:
-            print("  WARNING: No files to probe — assuming float32")
-        return _default
+            print("  WARNING: No files to probe")
+        return {"sst_var": "data", "lats": None, "lons": None, "raw_info": None}
 
-    sst_var = None
-    with Dataset(sample_path, "r") as nc:
-        for name in [VAR_SST, "sst"]:
-            if name in nc.variables:
-                sst_var = name
-                break
-
-    if sst_var is None:
-        if rank == 0:
-            print("  WARNING: Cannot find SST variable — assuming float32")
-        return _default
-
-    with Dataset(sample_path, "r") as nc:
-        v = nc.variables[sst_var]
-        dtype = str(v.dtype)
-        scale_factor = getattr(v, "scale_factor", None)
-        add_offset = getattr(v, "add_offset", None)
-        fill_value = getattr(v, "_FillValue", None)
-        shape = v.shape
-        lats = nc.variables[VAR_LAT][:].copy()
-        lons = nc.variables[VAR_LON][:].copy()
-
-    is_int16 = dtype.startswith("int16")
-    packed = is_int16 and scale_factor is not None
+    # Find SST variable name
+    with Dataset(sample, "r") as nc:
+        sst_var = next((n for n in ["data", "sst"] if n in nc.variables), None)
+        if sst_var is None:
+            if rank == 0:
+                print("  WARNING: Cannot find SST variable")
+            return {"sst_var": "data", "lats": None, "lons": None, "raw_info": None}
+        dtype = str(nc.variables[sst_var].dtype)
+        shape = nc.variables[sst_var].shape
+        lats = nc.variables["lat"][:].copy()
+        lons = nc.variables["lon"][:].copy()
 
     if rank == 0:
-        print(f"\n  Source format probe ({sample_path}):")
+        print(f"\n  Source format probe ({sample}):")
         print(f"    SST variable:   {sst_var}")
         print(f"    Storage dtype:  {dtype}")
         print(f"    Shape:          {shape}")
-        print(f"    Scale factor:   {scale_factor}")
-        print(f"    Add offset:     {add_offset}")
-        print(f"    Fill value:     {fill_value}")
         print(f"    Lat: {len(lats)}  [{lats[0]:.4f} .. {lats[-1]:.4f}]")
         print(f"    Lon: {len(lons)}  [{lons[0]:.4f} .. {lons[-1]:.4f}]")
-        if packed:
-            float32_size = N_YEARS * N_DAYS_PER_YEAR * N_LAT * N_LON * 4 / 1024**3
-            int16_size = N_YEARS * N_DAYS_PER_YEAR * N_LAT * N_LON * 2 / 1024**3
-            print(f"    PACKED READ ENABLED: I/O {float32_size:.1f} GB → {int16_size:.1f} GB "
-                  f"(-{float32_size - int16_size:.1f} GB)")
-        else:
-            print(f"    Standard float32 read (no packed benefit)")
 
-    # Probe raw byte read capability
-    raw_info = _probe_raw_read(sample_path, sst_var, date_to_path)
-    if raw_info and rank == 0:
-        print(f"    Raw I/O:         ENABLED (offset={raw_info['offset']}, "
-              f"{raw_info['nbytes']} bytes, direct seek+read)")
+    raw_info = _probe_raw_read(date_to_path)
 
-    return {
-        "packed": packed,
-        "scale_factor": scale_factor if scale_factor is not None else 0.0,
-        "add_offset": add_offset if add_offset is not None else 0.0,
-        "fill_value": fill_value,
-        "sst_var": sst_var if sst_var is not None else VAR_SST,
-        "dtype": dtype,
-        "lats": lats,
-        "lons": lons,
-        "sample_path": sample_path,
-        "raw_info": raw_info,
-    }
+    return {"sst_var": sst_var, "lats": lats, "lons": lons, "raw_info": raw_info}
 
 
-# ---------------------------------------------------------------------------
-# Backend detection (rank 0 only)
-# ---------------------------------------------------------------------------
+# ── Backend detection ──────────────────────────────────────────────────────
 
 def _detect_backend():
+    """Detect PyTorch ROCm/DCU backend. Returns num_gpus."""
+    import torch
     print("  Probing accelerator backends ...\n")
+    is_hip = hasattr(torch.version, "hip") and torch.version.hip is not None
+    if not is_hip or not torch.cuda.is_available():
+        raise RuntimeError("PyTorch ROCm/DCU backend not available")
 
-    # ── Path 1: PyTorch ROCm/DCU ──
-    try:
-        import torch
-        is_hip = hasattr(torch.version, "hip") and torch.version.hip is not None
-        if is_hip:
-            if torch.cuda.is_available():
-                device = torch.device("cuda")
-                props = torch.cuda.get_device_properties(device)
-                mem_gb = props.total_memory / 1024**3
-                print(f"  [PyTorch] ROCm/DCU backend  |  {props.name}  |  "
-                      f"{mem_gb:.1f} GB  |  Compute {props.major}.{props.minor}")
-                print(f"    HIP version: {torch.version.hip}")
-                return "torch", device
-            else:
-                print("  [PyTorch] ROCm/HIP compiled but torch.cuda.is_available()=False")
-        else:
-            if torch.cuda.is_available():
-                device = torch.device("cuda")
-                props = torch.cuda.get_device_properties(device)
-                name = props.name.lower()
-                if "amd" in name or "gfx" in name or "radeon" in name:
-                    mem_gb = props.total_memory / 1024**3
-                    print(f"  [PyTorch] Generic CUDA (AMD GPU)  |  {props.name}  |  "
-                          f"{mem_gb:.1f} GB")
-                    return "torch", device
-                else:
-                    mem_gb = props.total_memory / 1024**3
-                    print(f"  [PyTorch] Generic CUDA (NVIDIA)  |  {props.name}  |  "
-                          f"{mem_gb:.1f} GB")
-                    return "torch", device
-            else:
-                print("  [PyTorch] installed but no CUDA/ROCm support detected")
-    except ImportError:
-        print("  [PyTorch] not installed")
-    except Exception as e:
-        print(f"  [PyTorch] error during detection: {e}")
-
-    # ── Path 2: HIP native ──
-    try:
-        import hip
-        n_dev = hip.getDeviceCount()
-        if n_dev > 0:
-            props = hip.getDeviceProperties(0)
-            mem_gb = props.totalGlobalMem / 1024**3
-            print(f"  [HIP] {n_dev} device(s)  |  device 0: {props.name}  ({mem_gb:.1f} GB)")
-    except ImportError:
-        print("  [HIP] pyhip / hip-python not installed (optional)")
-    except Exception as e:
-        print(f"  [HIP] error during detection: {e}")
-
-    # ── Path 3: CuPy ROCm ──
-    try:
-        import cupy as cp
-        n_dev = cp.cuda.runtime.getDeviceCount()
-        if n_dev > 0:
-            cp.cuda.Device(0).use()
-            mem_gb = cp.cuda.Device(0).mem_info[1] / 1024**3
-            print(f"  [CuPy] {n_dev} device(s)  |  device 0: {mem_gb:.1f} GB")
-            return "cupy", 0
-        else:
-            print("  [CuPy] installed but no devices visible")
-    except ImportError:
-        print("  [CuPy] not installed")
-    except Exception as e:
-        print(f"  [CuPy] error during detection: {e}")
-
-    print("\n  [CPU] No accelerator detected, will use NumPy (CPU)")
-    return "cpu", None
+    props = torch.cuda.get_device_properties(torch.device("cuda"))
+    num_gpus = torch.cuda.device_count()
+    mem_gb = props.total_memory / 1024**3
+    print(f"  [PyTorch] ROCm/DCU backend  |  {props.name}  |  "
+          f"{mem_gb:.1f} GB  |  Compute {props.major}.{props.minor}")
+    print(f"    HIP version: {torch.version.hip}")
+    print(f"    GPUs: {num_gpus}")
+    return num_gpus
 
 
-# ---------------------------------------------------------------------------
-# PyTorch compute kernels (identical to compute_server.py)
-# ---------------------------------------------------------------------------
+# ── P90 kernel ─────────────────────────────────────────────────────────────
 
 def _p90_fast_torch(t, dim=1):
+    """float16 topk-based P90 with linear interpolation."""
     import torch
-
     n_time = t.shape[dim]
     p90_pos = 0.90 * (n_time - 1)
-    k0_idx = int(p90_pos)
-    k1_idx = min(k0_idx + 1, n_time - 1)
-    w_frac = p90_pos - k0_idx
-    topk_n = n_time - k0_idx
+    k0 = int(p90_pos)
+    topk_n = n_time - k0
 
     inf = torch.tensor(float("inf"), device=t.device, dtype=t.dtype)
     filled = torch.where(torch.isnan(t), inf, t)
@@ -388,106 +224,66 @@ def _p90_fast_torch(t, dim=1):
     idx[dim] = -1
     v0 = topvals[tuple(idx)]
 
-    if k1_idx == k0_idx:
+    k1 = min(k0 + 1, n_time - 1)
+    if k1 == k0:
         p90 = v0
     else:
         idx[dim] = -2
         v1 = topvals[tuple(idx)]
-        p90 = v0 + (v1 - v0) * w_frac
+        p90 = v0 + (v1 - v0) * (p90_pos - k0)
 
-    p90 = torch.where(torch.isinf(p90), float("nan"), p90)
-    return p90
-
-
-def _compute_torch_band(data_np, device, bands, packed=False,
-                        scale_factor=None, add_offset=None, fill_value=None):
-    import torch
-
-    threshold = np.full((N_OUTPUT_DAYS, N_LAT, N_LON), np.nan, dtype=np.float32)
-    climatology = np.full((N_OUTPUT_DAYS, N_LAT, N_LON), np.nan, dtype=np.float32)
-
-    for band_idx, (r0, r1) in enumerate(bands):
-        t0 = time.time()
-        band_rows = r1 - r0
-
-        band_t = torch.from_numpy(data_np[:, :, r0:r1, :].copy()).to(device)
-
-        if packed:
-            band_t = band_t.to(torch.float32)
-            mask = band_t == fill_value
-            band_t.mul_(scale_factor).add_(add_offset)
-            band_t[mask] = float('nan')
-
-        # unfold → permute → reshape (single contiguous copy, same approach as ls/new)
-        windows_view = band_t.unfold(dimension=1, size=WINDOW_SIZE, step=1)
-
-        with torch.inference_mode():
-            for d0 in range(0, N_OUTPUT_DAYS, SUB_BATCH_DAYS):
-                d1 = min(d0 + SUB_BATCH_DAYS, N_OUTPUT_DAYS)
-                n_days = d1 - d0
-
-                sub = windows_view[:, d0:d1, :, :, :]
-                sub = sub.permute(1, 0, 4, 2, 3).reshape(
-                    n_days, N_YEARS * WINDOW_SIZE, band_rows, N_LON)
-
-                sub_thresh = _p90_fast_torch(sub, dim=1)
-                sub_clim = torch.nanmean(sub, dim=1)
-
-                threshold[d0:d1, r0:r1, :] = sub_thresh.cpu().numpy().astype(np.float32)
-                climatology[d0:d1, r0:r1, :] = sub_clim.cpu().numpy().astype(np.float32)
-
-                del sub, sub_thresh, sub_clim
-
-        del band_t, windows_view
-        torch.cuda.empty_cache()
-
-        elapsed = time.time() - t0
-        print(f"  Band {band_idx+1}/{len(bands)} rows [{r0}:{r1}] done ({elapsed:.1f}s)")
-
-    return threshold, climatology
+    return torch.where(torch.isinf(p90), float("nan"), p90)
 
 
-def _compute_torch_multi_gpu(data_np, num_gpus, bands, packed=False,
-                             scale_factor=None, add_offset=None, fill_value=None):
+# ── GPU compute ────────────────────────────────────────────────────────────
+
+def _compute_torch(data_np, bands):
+    """Multi-GPU threaded compute (also handles single-GPU case).
+
+    Each GPU thread:
+      1. Transfers compact band (30, 102, rows, 1440) f16 → GPU (~500 MiB)
+      2. unfold + permute + reshape → (n_days, 330, rows, 1440)
+      3. topk P90 + nanmean (f16)
+      4. Results back to CPU
+    """
     import torch
     import threading
 
+    num_gpus = torch.cuda.device_count()
+
+    # Round-robin bands across GPUs
     band_groups = [[] for _ in range(num_gpus)]
     for i, band in enumerate(bands):
         band_groups[i % num_gpus].append(band)
 
-    print(f"  Multi-GPU ({num_gpus} GPUs):")
-    for gpu_id, group in enumerate(band_groups):
-        print(f"    GPU {gpu_id}: {len(group)} bands {group}")
+    print(f"  GPUs: {num_gpus}, Bands: {bands}")
+    for gid, group in enumerate(band_groups):
+        if group:
+            print(f"    GPU {gid}: {len(group)} bands {group}")
 
     threshold = np.full((N_OUTPUT_DAYS, N_LAT, N_LON), np.nan, dtype=np.float32)
     climatology = np.full((N_OUTPUT_DAYS, N_LAT, N_LON), np.nan, dtype=np.float32)
 
-    def _thread_worker(gpu_id, group):
+    def _worker(gpu_id, group):
+        if not group:
+            return
         torch.cuda.set_device(gpu_id)
 
         for r0, r1 in group:
             t0 = time.time()
 
-            # Transfer compact band to GPU (504 MiB per band) and expand there.
-            # GPU HBM2 bandwidth (~1 TB/s) >> PCIe (~16 GB/s), so compact
-            # transfer + GPU-side unfold/permute/reshape beats CPU pre-build.
-            band_t = torch.from_numpy(data_np[:, :, r0:r1, :].copy()).to(gpu_id)
-            windows_view = band_t.unfold(dimension=1, size=WINDOW_SIZE, step=1)
+            # Transfer compact band to GPU — expand there (HBM2 >> PCIe)
+            band_t = torch.from_numpy(
+                data_np[:, :, r0:r1, :].copy()).to(gpu_id)
+            windows = band_t.unfold(dimension=1, size=WINDOW_SIZE, step=1)
 
             with torch.inference_mode():
                 for d0 in range(0, N_OUTPUT_DAYS, SUB_BATCH_DAYS):
                     d1 = min(d0 + SUB_BATCH_DAYS, N_OUTPUT_DAYS)
                     n_days = d1 - d0
 
-                    sub = windows_view[:, d0:d1].permute(1, 0, 4, 2, 3).reshape(
+                    sub = windows[:, d0:d1].permute(1, 0, 4, 2, 3).reshape(
                         n_days, N_YEARS * WINDOW_SIZE, r1 - r0, N_LON)
-
-                    if packed:
-                        sub = sub.to(torch.float32)
-                        mask = sub == fill_value
-                        sub.mul_(scale_factor).add_(add_offset)
-                        sub[mask] = float('nan')
 
                     sub_thresh = _p90_fast_torch(sub, dim=1)
                     sub_clim = torch.nanmean(sub, dim=1)
@@ -499,195 +295,40 @@ def _compute_torch_multi_gpu(data_np, num_gpus, bands, packed=False,
 
                     del sub, sub_thresh, sub_clim
 
-            del band_t, windows_view
+            del band_t, windows
             torch.cuda.empty_cache()
-
-            elapsed = time.time() - t0
-            print(f"  [GPU {gpu_id}] Band rows [{r0}:{r1}] done ({elapsed:.1f}s)")
-
-        if gpu_id == 0:
-            print(f"  [GPU 0] All bands done")
+            print(f"  [GPU {gpu_id}] Band [{r0}:{r1}] done "
+                  f"({time.time() - t0:.1f}s)")
 
     threads = []
-    for gpu_id, group in enumerate(band_groups):
-        if not group:
-            continue
-        t = threading.Thread(target=_thread_worker, args=(gpu_id, group))
+    for gid, group in enumerate(band_groups):
+        t = threading.Thread(target=_worker, args=(gid, group))
         t.start()
         threads.append(t)
-
     for t in threads:
         t.join()
 
     return threshold, climatology
 
 
-# ---------------------------------------------------------------------------
-# CuPy backend (identical to compute_server.py)
-# ---------------------------------------------------------------------------
-
-def _compute_cupy_band(data_np, device_id, bands, packed=False,
-                       scale_factor=None, add_offset=None, fill_value=None):
-    import cupy as cp
-
-    cp.cuda.Device(device_id).use()
-
-    threshold = np.full((N_OUTPUT_DAYS, N_LAT, N_LON), np.nan, dtype=np.float32)
-    climatology = np.full((N_OUTPUT_DAYS, N_LAT, N_LON), np.nan, dtype=np.float32)
-
-    for band_idx, (r0, r1) in enumerate(bands):
-        t0 = time.time()
-        band_rows = r1 - r0
-
-        band_data = data_np[:, :, r0:r1, :].copy()
-        data_g = cp.asarray(band_data, dtype=cp.float32)
-
-        if packed:
-            data_g = data_g.astype(cp.float32)
-            mask = data_g == fill_value
-            data_g *= scale_factor
-            data_g += add_offset
-            data_g[mask] = cp.nan
-
-        windows_g = cp.empty((N_OUTPUT_DAYS, N_YEARS * WINDOW_SIZE, band_rows, N_LON),
-                             dtype=cp.float32)
-        for i in range(N_OUTPUT_DAYS):
-            w = data_g[:, i:i + WINDOW_SIZE, :, :]
-            windows_g[i] = w.reshape(N_YEARS * WINDOW_SIZE, band_rows, N_LON)
-
-        del data_g
-        cp.get_default_memory_pool().free_all_blocks()
-
-        windows_g.sort(axis=1)
-
-        valid_count = (~cp.isnan(windows_g)).sum(axis=1)
-
-        v_idx = 0.90 * (valid_count - 1)
-        v_idx = cp.clip(v_idx, 0, None)
-        lo_idx = cp.floor(v_idx).astype(cp.int32)
-        hi_idx = cp.minimum(lo_idx + 1, valid_count - 1).astype(cp.int32)
-        frac = (v_idx - lo_idx).astype(cp.float32)
-
-        batch_idx = cp.arange(N_OUTPUT_DAYS)[:, None, None]
-        row_idx = cp.arange(band_rows)[None, :, None]
-        col_idx = cp.arange(N_LON)[None, None, :]
-
-        lo_vals = windows_g[batch_idx, lo_idx, row_idx, col_idx]
-        hi_vals = windows_g[batch_idx, hi_idx, row_idx, col_idx]
-        band_thresh = lo_vals + frac * (hi_vals - lo_vals)
-
-        nan_mask = cp.isnan(windows_g)
-        windows_clean = cp.where(nan_mask, 0.0, windows_g)
-        band_clim = windows_clean.sum(axis=1) / cp.maximum(valid_count, 1)
-
-        threshold[:, r0:r1, :] = cp.asnumpy(band_thresh.astype(cp.float32))
-        climatology[:, r0:r1, :] = cp.asnumpy(band_clim.astype(cp.float32))
-
-        del windows_g, band_thresh, band_clim
-        cp.get_default_memory_pool().free_all_blocks()
-        gc.collect()
-
-        elapsed = time.time() - t0
-        print(f"  Band {band_idx+1}/{len(bands)} rows [{r0}:{r1}] done ({elapsed:.1f}s)")
-
-    return threshold, climatology
-
-
-# ---------------------------------------------------------------------------
-# CPU fallback (identical to compute_server.py)
-# ---------------------------------------------------------------------------
-
-def _compute_cpu(data_np, packed=False, scale_factor=None,
-                 add_offset=None, fill_value=None):
-    t0 = time.time()
-
-    threshold = np.full((N_OUTPUT_DAYS, N_LAT, N_LON), np.nan, dtype=np.float32)
-    climatology = np.full((N_OUTPUT_DAYS, N_LAT, N_LON), np.nan, dtype=np.float32)
-
-    for i in range(N_OUTPUT_DAYS):
-        window = data_np[:, i:i + WINDOW_SIZE, :, :]
-
-        if packed:
-            window = window.astype(np.float32)
-            mask = window == fill_value
-            window *= scale_factor
-            window += add_offset
-            window[mask] = np.nan
-
-        flat = window.reshape(N_YEARS * WINDOW_SIZE, N_LAT, N_LON)
-
-        n_time = flat.shape[0]
-        p90_pos = 0.90 * (n_time - 1)
-        k0_idx = int(p90_pos)
-        k1_idx = min(k0_idx + 1, n_time - 1)
-        w_frac = p90_pos - k0_idx
-
-        filled = np.where(np.isnan(flat), np.inf, flat)
-        part = np.partition(filled, kth=(k0_idx, k1_idx), axis=0)
-        v0 = part[k0_idx]
-        if k1_idx == k0_idx:
-            p90 = v0
-        else:
-            v1 = part[k1_idx]
-            p90 = v0 + (v1 - v0) * w_frac
-        threshold[i] = np.where(np.isinf(p90), np.nan, p90).astype(np.float32)
-        climatology[i] = np.nanmean(flat, axis=0).astype(np.float32)
-        if (i + 1) % 10 == 0 or i == 0:
-            elapsed = time.time() - t0
-            rate = (i + 1) / elapsed
-            eta = (N_OUTPUT_DAYS - i - 1) / rate if rate > 0 else 0
-            print(f"  Day {i+1}/{N_OUTPUT_DAYS}  ({elapsed:.0f}s elapsed, ETA {eta:.0f}s)")
-
-    elapsed = time.time() - t0
-    print(f"  CPU compute: {elapsed:.1f}s")
-    return threshold, climatology
-
-
-# ---------------------------------------------------------------------------
-# Latitude bands
-# ---------------------------------------------------------------------------
+# ── Latitude bands ─────────────────────────────────────────────────────────
 
 def build_bands():
-    base = N_LAT // N_BANDS
-    rem = N_LAT % N_BANDS
-    bands = []
-    r0 = 0
+    base, rem = divmod(N_LAT, N_BANDS)
+    bands, r0 = [], 0
     for i in range(N_BANDS):
-        size_band = base + (1 if i < rem else 0)
-        bands.append((r0, r0 + size_band))
-        r0 += size_band
+        sz = base + (1 if i < rem else 0)
+        bands.append((r0, r0 + sz))
+        r0 += sz
     return bands
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def bcast_str(s):
-    """Broadcast a Python string from rank 0."""
-    # Pack string as fixed-length array
-    if rank == 0:
-        encoded = s.encode("utf-8")
-        n = np.array(len(encoded), dtype=np.int32)
-    else:
-        n = np.empty(1, dtype=np.int32)
-    comm.Bcast(n, root=0)
-    if rank == 0:
-        buf = np.frombuffer(encoded, dtype=np.uint8)
-    else:
-        buf = np.empty(n[0], dtype=np.uint8)
-    comm.Bcast(buf, root=0)
-    return buf.tobytes().decode("utf-8")
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# ── Main ───────────────────────────────────────────────────────────────────
 
 def main():
-    prep_start = time.time()
+    t_prep = time.time()
 
-    # ---- Rank 0: Prep & format detection ----
+    # ── Prep: file index & format probe ──
     if rank == 0:
         print(f"MPI mode: {size} ranks")
         print("Building file index ...")
@@ -695,41 +336,17 @@ def main():
     if rank == 0:
         print(f"  Indexed {len(date_to_path)} files")
 
-    # Detect source format (all ranks probe independently — fast, 1 file)
     fmt = detect_source_format(date_to_path)
-    packed = fmt["packed"]
-    scale_factor = fmt["scale_factor"]
-    add_offset = fmt["add_offset"]
-    fill_value = fmt["fill_value"]
     sst_var = fmt["sst_var"]
-    raw_info = fmt.get("raw_info")
-
-    if packed and fill_value is None:
-        fill_value = -32768
-        if rank == 0:
-            print(f"  NOTE: No _FillValue found — using {fill_value} as fill sentinel")
-
-    # Data array dtype
-    if packed:
-        data_dtype = np.int16
-        elem_bytes = 2
-        nan_fill = fill_value if fill_value is not None else -32768
-        packed_tag = "int16-packed"
-    else:
-        data_dtype = np.float16
-        elem_bytes = 2
-        nan_fill = np.nan
-        packed_tag = "float16"
+    lats, lons = fmt["lats"], fmt["lons"]
+    raw_info = fmt["raw_info"]
 
     shape = (N_YEARS, N_DAYS_PER_YEAR, N_LAT, N_LON)
-    size_gb = N_YEARS * N_DAYS_PER_YEAR * N_LAT * N_LON * elem_bytes / 1024**3
+    size_gb = N_YEARS * N_DAYS_PER_YEAR * N_LAT * N_LON * 2 / 1024**3  # float16
     if rank == 0:
-        if packed:
-            print(f"  Scale: raw_int16 * {scale_factor} + {add_offset}")
-            print(f"  Fill value masking: raw == {fill_value} → NaN")
-        print(f"  Data array {shape} {packed_tag} ({size_gb:.2f} GB)")
+        print(f"  Data array {shape} float16 ({size_gb:.2f} GB)")
 
-    # ---- Build year tasks (all ranks) ----
+    # ── Build year→files mapping ──
     needed_dates = []
     for y in range(START_YEAR, END_YEAR + 1):
         needed_dates.extend(get_date_strings_for_year(y))
@@ -739,171 +356,107 @@ def main():
         if fp is not None:
             by_year[ds[:4]].append((j, fp))
 
-    # ---- Each rank computes its assigned years ----
-    my_years = sorted([yr for yr in by_year.keys()
-                       if (int(yr) - START_YEAR) % size == rank])
-    n_my_years = len(my_years)
+    # ── Assign years to ranks ──
+    my_years = sorted(yr for yr in by_year
+                      if (int(yr) - START_YEAR) % size == rank)
 
     if rank == 0:
         print(f"\n  Year distribution: {size} ranks for {len(by_year)} years")
         for r in range(size):
-            r_years = sorted([yr for yr in by_year.keys()
-                             if (int(yr) - START_YEAR) % size == r])
+            r_years = sorted(yr for yr in by_year
+                            if (int(yr) - START_YEAR) % size == r)
             if r_years:
-                print(f"    rank {r:2d}: years {r_years[0]}..{r_years[-1]} ({len(r_years)} years)")
+                print(f"    rank {r:2d}: {r_years[0]}..{r_years[-1]} "
+                      f"({len(r_years)} year(s))")
 
-    # ---- Backend detection (rank 0 only, before I/O) ----
+    # ── Backend detection (rank 0, before I/O timer) ──
     if rank == 0:
-        print(f"\nDetecting accelerator backend ...")
-        setup_start = time.time()
-        backend, device = _detect_backend()
-        setup_time = time.time() - setup_start
+        print("\nDetecting accelerator backend ...")
+        t_setup = time.time()
+        num_gpus = _detect_backend()
+        setup_time = time.time() - t_setup
     else:
-        backend, device, setup_time = None, None, 0.0
-    # Broadcast backend choice
-    backend = comm.bcast(backend, root=0)
-    # device is either torch.device or int; string is fine to bcast
-    if backend == "torch":
-        if rank == 0:
-            device_str = str(device)  # "cuda" or "cuda:0"
-        else:
-            device_str = None
-        device_str = comm.bcast(device_str, root=0)
-        if rank != 0:
-            import torch
-            device = torch.device(device_str)
-    elif backend == "cupy":
-        device = comm.bcast(device, root=0)
+        num_gpus, setup_time = 0, 0.0
+    num_gpus = comm.bcast(num_gpus, root=0)
     setup_time = comm.bcast(setup_time, root=0)
 
-    # ---- Lat/lon coords (from format detection) ----
-    lats = fmt["lats"]
-    lons = fmt["lons"]
-
-    # ---- MPI Distributed I/O (direct-to-shared-memory, no gather step) ----
-    # Allocate MPI shared memory BEFORE reading — each rank writes directly
-    # to data[yr_idx, day_idx], eliminating the intermediate local_data +
-    # separate gather copy (~2s savings).
-    total_bytes = shape[0] * shape[1] * shape[2] * shape[3] * elem_bytes
+    # ── MPI Distributed I/O (direct-to-shm, zero gather) ──
+    total_bytes = shape[0] * shape[1] * shape[2] * shape[3] * 2  # float16 = 2 bytes
     win_size = total_bytes if rank == 0 else 0
     win = MPI.Win.Allocate_shared(win_size, 1, comm=comm)
     shm_mem, _ = win.Shared_query(0)
-    data = np.ndarray(shape, dtype=data_dtype, buffer=shm_mem)
+    data = np.ndarray(shape, dtype=np.float16, buffer=shm_mem)
 
     if rank == 0:
         io_label = f"{IO_THREADS} threads" if IO_THREADS > 1 else "1 thread"
-        print(f"\nReading {n_my_years} years per rank "
-              f"(MPI distributed, {packed_tag}"
-              f"{', raw I/O' if raw_info else ', netCDF4'}, {io_label}, "
+        raw_label = "raw I/O" if raw_info else "netCDF4"
+        print(f"\nReading {len(my_years)} years per rank "
+              f"(MPI distributed, float16, {raw_label}, {io_label}, "
               f"direct-to-shm) ...")
     comm.Barrier()
-    io_start = time.time()
+    t_io = time.time()
 
-    # Flatten all (year_idx, idx_slot, fp) — year_idx maps directly into data
-    all_items = []
-    for year in my_years:
-        yr_idx = int(year) - START_YEAR
-        for idx_slot, fp in by_year[year]:
-            all_items.append((yr_idx, idx_slot, fp))
+    # Flatten assigned work
+    items = [(int(yr) - START_YEAR, slot, fp)
+             for yr in my_years
+             for slot, fp in by_year[yr]]
 
-    def _read_chunk(items_chunk):
-        """Read files and write directly into shared data array (no local_data)."""
-        for yr_idx, idx_slot, fp in items_chunk:
-            if raw_info is not None:
-                block = raw_read_sst(fp, raw_info)
-            else:
-                with Dataset(fp, "r") as ds:
-                    block = ds.variables[sst_var][:]
+    def _read_chunk(chunk):
+        for yr_idx, idx_slot, fp in chunk:
+            block = (raw_read_sst(fp, raw_info) if raw_info
+                     else Dataset(fp, "r").variables[sst_var][:])
             block = np.squeeze(block)
             if block.shape != (N_LAT, N_LON):
                 block = block.T
-            day_idx = idx_slot % N_DAYS_PER_YEAR
-            data[yr_idx, day_idx] = np.asarray(block, dtype=data_dtype)
+            data[yr_idx, idx_slot % N_DAYS_PER_YEAR] = \
+                np.asarray(block, dtype=np.float16)
 
-    n_items = len(all_items)
-    if IO_THREADS > 1 and n_items > IO_THREADS:
-        chunk_size = (n_items + IO_THREADS - 1) // IO_THREADS
+    if IO_THREADS > 1 and len(items) > IO_THREADS:
+        n_per = (len(items) + IO_THREADS - 1) // IO_THREADS
         with ThreadPoolExecutor(max_workers=IO_THREADS) as pool:
-            futures = []
-            for t in range(IO_THREADS):
-                start = t * chunk_size
-                end = min(start + chunk_size, n_items)
-                if start < end:
-                    futures.append(pool.submit(_read_chunk, all_items[start:end]))
+            futures = [pool.submit(_read_chunk, items[t * n_per:(t + 1) * n_per])
+                       for t in range(IO_THREADS) if t * n_per < len(items)]
             for f in futures:
                 f.result()
     else:
-        _read_chunk(all_items)
+        _read_chunk(items)
 
-    # Barrier ensures all writes from all ranks complete before rank 0 reads
     comm.Barrier()
-    io_elapsed = time.time() - io_start
+    io_elapsed = time.time() - t_io
     if rank == 0:
         print(f"  MPI I/O total: {io_elapsed:.1f}s (no gather — direct to shm)")
 
-    # ---- Only rank 0 does compute and save ----
+    # ── Rank > 0: done ──
     if rank != 0:
         return
 
-    # Copy data from shared memory to local heap memory.
-    # Shared memory cross-rank access can trigger NUMA misses / page faults
-    # that slow down GPU compute by 3-4x. A one-time copy (~1s) saves 10-15s
-    # during the multiday compute loop.
+    # ── Copy shm → local heap (avoid NUMA cross-rank page faults) ──
     t_copy = time.time()
     data = data.copy()
     del win
     gc.collect()
-    if rank == 0:
-        print(f"  Local copy: {time.time() - t_copy:.1f}s")
+    print(f"  Local copy: {time.time() - t_copy:.1f}s")
 
-    # ---- Compute (rank 0 only, same as compute_server.py) ----
+    # ── Compute ──
     print(f"\nComputing threshold & climatology "
           f"({N_OUTPUT_DAYS} days x 30-year sliding window) ...")
-
-    compute_start = time.time()
     bands = build_bands()
-
-    if backend == "torch":
-        import torch
-        num_gpus = torch.cuda.device_count()
-        if num_gpus > 1:
-            print(f"  Detected {num_gpus} GPUs — using multi-GPU parallel mode")
-            print(f"  Bands: {bands}")
-            threshold, climatology = _compute_torch_multi_gpu(
-                data, num_gpus, bands,
-                packed=packed, scale_factor=scale_factor,
-                add_offset=add_offset, fill_value=fill_value)
-        else:
-            print(f"  Single GPU mode")
-            print(f"  Bands: {bands}")
-            threshold, climatology = _compute_torch_band(
-                data, device, bands,
-                packed=packed, scale_factor=scale_factor,
-                add_offset=add_offset, fill_value=fill_value)
-    elif backend == "cupy":
-        threshold, climatology = _compute_cupy_band(
-            data, device, bands,
-            packed=packed, scale_factor=scale_factor,
-            add_offset=add_offset, fill_value=fill_value)
-    else:
-        threshold, climatology = _compute_cpu(
-            data, packed=packed, scale_factor=scale_factor,
-            add_offset=add_offset, fill_value=fill_value)
-
-    del data
-    gc.collect()
-
-    compute_elapsed = time.time() - compute_start
+    t_compute = time.time()
+    threshold, climatology = _compute_torch(data, bands)
+    compute_elapsed = time.time() - t_compute
     print(f"  Compute: {compute_elapsed:.1f}s")
 
-    # ---- Save ----
+    del data; gc.collect()
+
+    # ── Save ──
     print("\nSaving ...")
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    base_dates = build_365_calendar(2020)
+    # DOY 152 = Jun 1 in a non-leap year (equivalent to 365-day calendar)
+    d0_2019 = datetime(2019, 1, 1)  # 2019 is not a leap year
     for out_idx in range(N_OUTPUT_DAYS):
-        doy = 147 + WINDOW_HALF + out_idx
-        dt = base_dates[doy - 1]
+        doy = 152 + out_idx                       # Jun 1 = DOY 152
+        dt = d0_2019 + timedelta(days=doy - 1)
         fname = dt.strftime("%m%d.nc")
 
         with Dataset(OUT_DIR / fname, "w", format="NETCDF4") as nc:
@@ -933,38 +486,38 @@ def main():
 
             nc.baseline_period = "1991-2020"
 
+    t_end = time.time()
+    save_elapsed = t_end - t_compute - compute_elapsed
+
     print(f"  Saved {N_OUTPUT_DAYS} files to {OUT_DIR}/")
 
-    compute_end = time.time()
-    save_elapsed = compute_end - (compute_start + compute_elapsed)
-
-    prep_end = io_start  # prep runs until I/O starts
-    prep_elapsed = prep_end - prep_start - setup_time
+    # ── Timing breakdown ──
+    prep_elapsed = t_io - t_prep - setup_time
     total_elapsed = io_elapsed + compute_elapsed + save_elapsed
 
     print(f"\n{'='*60}")
-    print(f"  TIMING BREAKDOWN (MPI, {packed_tag})")
+    print(f"  TIMING BREAKDOWN (MPI, float16)")
     print(f"{'='*60}")
-    print(f"  Prep:       {prep_elapsed:8.1f}s          (file index + format probe)")
-    print(f"  Setup:      {setup_time:8.1f}s          (before I/O, not counted)")
-    print(f"  I/O:        {io_elapsed:8.1f}s  (MPI distributed)")
+    print(f"  Prep:       {prep_elapsed:8.1f}s   (file index + format probe)")
+    print(f"  Setup:      {setup_time:8.1f}s   (backend detection, not counted)")
+    print(f"  I/O:        {io_elapsed:8.1f}s   (MPI distributed)")
     print(f"  Compute:    {compute_elapsed:8.1f}s")
     print(f"  Save:       {save_elapsed:8.1f}s")
     print(f"  {'─'*50}")
     print(f"  Total:      {total_elapsed:8.3f}s  ({total_elapsed/60:.2f} min)")
     print(f"{'='*60}")
+    print(f"Done!")
 
-    print(f"real {int(total_elapsed//60)}m{total_elapsed%60:.3f}s  (I/O+Compute+Save)")
-    print("Done!")
-
-    # ---- Validation ----
+    # ── Validation ──
     print(f"\nValidation:")
-    print(f"  P90_sst range:       [{np.nanmin(threshold):.2f}, {np.nanmax(threshold):.2f}]")
-    print(f"  Climmean range:      [{np.nanmin(climatology):.2f}, {np.nanmax(climatology):.2f}]")
+    print(f"  P90_sst range:       [{np.nanmin(threshold):.2f}, "
+          f"{np.nanmax(threshold):.2f}]")
+    print(f"  Climmean range:      [{np.nanmin(climatology):.2f}, "
+          f"{np.nanmax(climatology):.2f}]")
     print(f"  NaN fraction (P90):  {np.isnan(threshold).mean()*100:.1f}%")
-    print(f"  P90 > Climmean (mean): {np.nanmean(threshold) > np.nanmean(climatology)}")
+    print(f"  P90 > Climmean (mean): "
+          f"{np.nanmean(threshold) > np.nanmean(climatology)}")
 
 
 if __name__ == "__main__":
-    _wall_start = time.time()
     main()
