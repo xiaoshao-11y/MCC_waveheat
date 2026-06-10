@@ -65,7 +65,7 @@ Shell real: ~42s  (含 import + prep)
 
 | 优化 | 原理 | 效果 |
 |------|------|------|
-| **HIP 融合内核** | `load_inline` 编译 HIP kernel，nanmean + NaN→inf + top-34 P90 单次内存遍历 | 消除 3 次独立 kernel launch，Compute 14.5→7.4s |
+| **HIP 融合内核** | `torch.utils.cpp_extension.load` 编译 HIP kernel，nanmean + NaN→inf + top-34 P90 单次内存遍历 | 消除 3 次独立 kernel launch，Compute 14.5→7.4s |
 | **unfold + permute + reshape** | 单次连续拷贝做维度合并，替代 advanced indexing | 更快的内存布局转换 |
 | **float16 全程** | 不做 f16→f32 转换，直接 f16 输入 kernel | 省显存和省转换开销 |
 | **torch.inference_mode()** | 关闭 autograd 计算图追踪 | 省显存 |
