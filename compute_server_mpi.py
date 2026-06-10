@@ -49,7 +49,7 @@ DATE_START = (5, 27)
 DATE_END = (9, 5)
 
 N_BANDS = int(os.environ.get("N_BANDS", "12"))
-SUB_BATCH_DAYS = int(os.environ.get("SUB_BATCH_DAYS", "46"))
+SUB_BATCH_DAYS = int(os.environ.get("SUB_BATCH_DAYS", "92"))
 IO_THREADS = int(os.environ.get("IO_THREADS", "4"))
 
 
@@ -206,52 +206,152 @@ def _detect_backend():
     return num_gpus
 
 
-# ── P90 kernel ─────────────────────────────────────────────────────────────
-
-def _p90_fast_torch(t, dim=1):
-    """float16 topk-based P90 with linear interpolation."""
-    import torch
-    n_time = t.shape[dim]
-    p90_pos = 0.90 * (n_time - 1)
-    k0 = int(p90_pos)
-    topk_n = n_time - k0
-
-    inf = torch.tensor(float("inf"), device=t.device, dtype=t.dtype)
-    filled = torch.where(torch.isnan(t), inf, t)
-    topvals, _ = torch.topk(filled, k=topk_n, dim=dim, largest=True, sorted=True)
-
-    idx = [slice(None)] * t.ndim
-    idx[dim] = -1
-    v0 = topvals[tuple(idx)]
-
-    k1 = min(k0 + 1, n_time - 1)
-    if k1 == k0:
-        p90 = v0
-    else:
-        idx[dim] = -2
-        v1 = topvals[tuple(idx)]
-        p90 = v0 + (v1 - v0) * (p90_pos - k0)
-
-    return torch.where(torch.isinf(p90), float("nan"), p90)
 
 
 # ── GPU compute ────────────────────────────────────────────────────────────
 
-def _compute_torch(data_np, bands):
-    """Multi-GPU threaded compute (also handles single-GPU case).
+# ── HIP fused kernel compilation (called once, before timing) ──────────
 
-    Each GPU thread:
-      1. Transfers compact band (30, 102, rows, 1440) f16 → GPU (~500 MiB)
-      2. unfold + permute + reshape → (n_days, 330, rows, 1440)
-      3. topk P90 + nanmean (f16)
-      4. Results back to CPU
+def _load_fused_kernel():
+    """Compile or load cached HIP kernel (nanmean + P90 in one pass).
+    Returns callable(_fused_fn) or None on failure.
+    Must be called on rank 0 before compute timing starts.
     """
+    import torch
+
+    _kernel_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               ".fused_kernel")
+    try:
+        hip_src = r"""
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <torch/extension.h>
+
+extern "C" __global__ void fused_stats_kernel(
+    const __half* __restrict__ sub,   // (n_days, 330, rows, n_lon) f16
+    float* __restrict__ p90_out,      // (n_days, rows, n_lon) f32
+    float* __restrict__ mean_out,     // (n_days, rows, n_lon) f32
+    long long n_days, long long n_total, long long rows, long long n_lon
+) {
+    long long lon = blockIdx.x * blockDim.x + threadIdx.x;
+    long long day_lat = blockIdx.y;
+    long long day = day_lat / rows;
+    long long lat = day_lat % rows;
+
+    if (lon >= n_lon) return;
+
+    // Use 64-bit to avoid int32 overflow: day * n_total * rows * n_lon > 2^31
+    const __half* base = sub + day * (n_total * rows * n_lon) + lat * n_lon + lon;
+    long long stride = rows * n_lon;
+
+    // top-34 in descending order, registers only
+    __half top[34];
+    #pragma unroll
+    for (int i = 0; i < 34; i++) top[i] = __float2half(-__builtin_huge_valf());
+
+    float sum = 0.0f;
+    long long count = 0;
+
+    for (long long s = 0; s < n_total; s++) {
+        __half v = base[s * stride];
+        if (__hisnan(v)) {
+            v = __float2half(__builtin_huge_valf());
+        } else {
+            sum += __half2float(v);
+            count++;
+        }
+        if (__hgt(v, top[33])) {
+            int pos = 33;
+            while (pos > 0 && __hgt(v, top[pos - 1])) {
+                top[pos] = top[pos - 1];
+                pos--;
+            }
+            top[pos] = v;
+        }
+    }
+
+    long long out_idx = day * (rows * n_lon) + lat * n_lon + lon;
+    mean_out[out_idx] = (count > 0) ? sum / (float)count : __builtin_nanf("");
+
+    float v0 = __half2float(top[33]);
+    float v1 = __half2float(top[32]);
+    float p90 = v0 + (v1 - v0) * 0.1f;
+    p90_out[out_idx] = __isinff(v0) ? __builtin_nanf("") : p90;
+}
+
+void launch_fused_stats(
+    torch::Tensor sub,
+    torch::Tensor p90_out,
+    torch::Tensor mean_out)
+{
+    long long n_days = sub.size(0);
+    long long n_total = sub.size(1);
+    long long rows = sub.size(2);
+    long long n_lon = sub.size(3);
+
+    constexpr int BLOCK_LON = 256;
+    dim3 block(BLOCK_LON);
+    dim3 grid((n_lon + BLOCK_LON - 1) / BLOCK_LON, n_days * rows);
+
+    fused_stats_kernel<<<grid, block, 0, 0>>>(
+        reinterpret_cast<const __half*>(sub.data_ptr<at::Half>()),
+        p90_out.data_ptr<float>(),
+        mean_out.data_ptr<float>(),
+        n_days, n_total, rows, n_lon);
+}
+"""
+
+        cpp_src = r"""
+#include <torch/extension.h>
+void launch_fused_stats(torch::Tensor sub, torch::Tensor p90_out, torch::Tensor mean_out);
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("fused_stats", &launch_fused_stats);
+}
+"""
+
+        os.makedirs(_kernel_dir, exist_ok=True)
+        _hip_path = os.path.join(_kernel_dir, "fused_stats.hip")
+        _cpp_path = os.path.join(_kernel_dir, "fused_stats.cpp")
+        _hash_path = os.path.join(_kernel_dir, ".source_hash")
+
+        # Only rewrite sources if kernel code changed (avoid ninja recompile)
+        import hashlib
+        _new_hash = hashlib.sha256((hip_src + cpp_src).encode()).hexdigest()
+        _old_hash = None
+        if os.path.exists(_hash_path):
+            with open(_hash_path) as f:
+                _old_hash = f.read().strip()
+
+        if _new_hash != _old_hash:
+            # Kernel changed — blow away cache and rewrite sources
+            import shutil
+            for _p in [_hip_path, _cpp_path]:
+                if os.path.exists(_p):
+                    os.remove(_p)
+            with open(_hip_path, "w") as f:
+                f.write(hip_src)
+            with open(_cpp_path, "w") as f:
+                f.write(cpp_src)
+            with open(_hash_path, "w") as f:
+                f.write(_new_hash)
+
+        from torch.utils.cpp_extension import load
+        _mod = load(name="fused_stats", sources=[_cpp_path, _hip_path],
+                    build_directory=_kernel_dir, verbose=False)
+        print("  Fused kernel:   ENABLED (HIP: nanmean + P90 in one pass)")
+        return _mod.fused_stats
+    except Exception as e:
+        print(f"  Fused kernel:   FALLBACK to topk ({e})")
+        return None
+
+
+def _compute_torch(data_np, bands, fused_fn):
+    """Multi-GPU threaded compute with HIP-fused P90+mean kernel."""
     import torch
     import threading
 
     num_gpus = torch.cuda.device_count()
 
-    # Round-robin bands across GPUs
     band_groups = [[] for _ in range(num_gpus)]
     for i, band in enumerate(bands):
         band_groups[i % num_gpus].append(band)
@@ -260,6 +360,13 @@ def _compute_torch(data_np, bands):
     for gid, group in enumerate(band_groups):
         if group:
             print(f"    GPU {gid}: {len(group)} bands {group}")
+
+    # ── Fallback P90 ────────────────────────────────────────────────────
+    def _p90_fallback(sub):
+        sub.nan_to_num_(nan=float("inf"))
+        topvals = torch.topk(sub, k=34, dim=1, largest=True, sorted=True).values
+        p90 = topvals[:, -1, :, :] + (topvals[:, -2, :, :] - topvals[:, -1, :, :]) * 0.1
+        return torch.where(torch.isinf(p90), float("nan"), p90)
 
     threshold = np.full((N_OUTPUT_DAYS, N_LAT, N_LON), np.nan, dtype=np.float32)
     climatology = np.full((N_OUTPUT_DAYS, N_LAT, N_LON), np.nan, dtype=np.float32)
@@ -272,7 +379,6 @@ def _compute_torch(data_np, bands):
         for r0, r1 in group:
             t0 = time.time()
 
-            # Transfer compact band to GPU — expand there (HBM2 >> PCIe)
             band_t = torch.from_numpy(
                 data_np[:, :, r0:r1, :].copy()).to(gpu_id)
             windows = band_t.unfold(dimension=1, size=WINDOW_SIZE, step=1)
@@ -281,19 +387,27 @@ def _compute_torch(data_np, bands):
                 for d0 in range(0, N_OUTPUT_DAYS, SUB_BATCH_DAYS):
                     d1 = min(d0 + SUB_BATCH_DAYS, N_OUTPUT_DAYS)
                     n_days = d1 - d0
+                    rows = r1 - r0
 
                     sub = windows[:, d0:d1].permute(1, 0, 4, 2, 3).reshape(
-                        n_days, N_YEARS * WINDOW_SIZE, r1 - r0, N_LON)
+                        n_days, N_YEARS * WINDOW_SIZE, rows, N_LON)
 
-                    sub_thresh = _p90_fast_torch(sub, dim=1)
-                    sub_clim = torch.nanmean(sub, dim=1)
+                    if fused_fn is not None:
+                        p90_gpu = torch.empty(n_days, rows, N_LON,
+                                              dtype=torch.float32, device=gpu_id)
+                        mean_gpu = torch.empty(n_days, rows, N_LON,
+                                               dtype=torch.float32, device=gpu_id)
+                        fused_fn(sub, p90_gpu, mean_gpu)
+                        threshold[d0:d1, r0:r1, :] = p90_gpu.cpu().numpy()
+                        climatology[d0:d1, r0:r1, :] = mean_gpu.cpu().numpy()
+                        del p90_gpu, mean_gpu
+                    else:
+                        climatology[d0:d1, r0:r1, :] = (
+                            torch.nanmean(sub, dim=1).cpu().numpy().astype(np.float32))
+                        threshold[d0:d1, r0:r1, :] = (
+                            _p90_fallback(sub).cpu().numpy().astype(np.float32))
 
-                    threshold[d0:d1, r0:r1, :] = \
-                        sub_thresh.cpu().numpy().astype(np.float32)
-                    climatology[d0:d1, r0:r1, :] = \
-                        sub_clim.cpu().numpy().astype(np.float32)
-
-                    del sub, sub_thresh, sub_clim
+                    del sub
 
             del band_t, windows
             torch.cuda.empty_cache()
@@ -369,14 +483,16 @@ def main():
                 print(f"    rank {r:2d}: {r_years[0]}..{r_years[-1]} "
                       f"({len(r_years)} year(s))")
 
-    # ── Backend detection (rank 0, before I/O timer) ──
+    # ── Backend detection + kernel compile (rank 0, before I/O timer) ──
     if rank == 0:
         print("\nDetecting accelerator backend ...")
         t_setup = time.time()
         num_gpus = _detect_backend()
+        fused_fn = _load_fused_kernel()
         setup_time = time.time() - t_setup
     else:
         num_gpus, setup_time = 0, 0.0
+        fused_fn = None
     num_gpus = comm.bcast(num_gpus, root=0)
     setup_time = comm.bcast(setup_time, root=0)
 
@@ -430,19 +546,16 @@ def main():
     if rank != 0:
         return
 
-    # ── Copy shm → local heap (avoid NUMA cross-rank page faults) ──
-    t_copy = time.time()
-    data = data.copy()
-    del win
+    # ── Skip full shm→heap copy; band-level .copy() handles contiguous DMA ──
+    # Keep MPI window alive so data buffer stays valid during compute
     gc.collect()
-    print(f"  Local copy: {time.time() - t_copy:.1f}s")
 
     # ── Compute ──
     print(f"\nComputing threshold & climatology "
           f"({N_OUTPUT_DAYS} days x 30-year sliding window) ...")
     bands = build_bands()
     t_compute = time.time()
-    threshold, climatology = _compute_torch(data, bands)
+    threshold, climatology = _compute_torch(data, bands, fused_fn)
     compute_elapsed = time.time() - t_compute
     print(f"  Compute: {compute_elapsed:.1f}s")
 
@@ -487,24 +600,27 @@ def main():
             nc.baseline_period = "1991-2020"
 
     t_end = time.time()
-    save_elapsed = t_end - t_compute - compute_elapsed
+    total_elapsed = t_end - t_io
 
     print(f"  Saved {N_OUTPUT_DAYS} files to {OUT_DIR}/")
 
     # ── Timing breakdown ──
     prep_elapsed = t_io - t_prep - setup_time
-    total_elapsed = io_elapsed + compute_elapsed + save_elapsed
 
     print(f"\n{'='*60}")
     print(f"  TIMING BREAKDOWN (MPI, float16)")
     print(f"{'='*60}")
     print(f"  Prep:       {prep_elapsed:8.1f}s   (file index + format probe)")
-    print(f"  Setup:      {setup_time:8.1f}s   (backend detection, not counted)")
+    print(f"  Setup:      {setup_time:8.1f}s   (backend + kernel compile)")
     print(f"  I/O:        {io_elapsed:8.1f}s   (MPI distributed)")
     print(f"  Compute:    {compute_elapsed:8.1f}s")
-    print(f"  Save:       {save_elapsed:8.1f}s")
+    print(f"  Save:       {t_end - t_compute - compute_elapsed:8.1f}s")
     print(f"  {'─'*50}")
     print(f"  Total:      {total_elapsed:8.3f}s  ({total_elapsed/60:.2f} min)")
+    print(f"    (I/O start → save end, wall clock)")
+    grand_total = setup_time + total_elapsed
+    print(f"  Grand:      {grand_total:8.3f}s  ({grand_total/60:.2f} min)")
+    print(f"    (setup + I/O + compute + save)")
     print(f"{'='*60}")
     print(f"Done!")
 

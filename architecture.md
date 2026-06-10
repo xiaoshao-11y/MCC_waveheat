@@ -61,16 +61,17 @@ sdp/
        ▼  data: (30, 102, 721, 1440) float16 (共享内存)
        │
   ┌────────────────────────────────────┐
-  │  Local copy: shm → heap (~2.5s)     │  ← 避免 NUMA 跨 rank 访问
+  │  跳过全量 copy，shm 直接读            │  ← band 级 .copy() 保证 DMA 连续
   └────────────────────────────────────┘
        │
        ▼
   ┌────────────────────────────────────┐
-  │  Compute: _compute_torch_multi_gpu  │  ← 4 卡线程并行
+  │  Compute: _compute_torch            │  ← 4 卡线程并行
   │  N_BANDS bands ÷ 4 GPUs            │
   │  unfold(dim=1, size=11, step=1)     │    零拷贝窗口
   │  permute(1,0,4,2,3).reshape()      │    单次连续拷贝
-  │  topk P90 + torch.nanmean (f16)    │    ~14.5s (NB=12)
+  │  HIP fused kernel (f16)            │    ~7.4s (NB=16)
+  │    nanmean + NaN→inf + top-34 P90  │    单 kernel 完成
   │  线程共享 data_np，.copy() 确保连续  │
   └────────────────────────────────────┘
        │
@@ -155,19 +156,20 @@ N_BANDS bands 轮询分配到 4 GPU
       sub_clim = torch.nanmean(sub, dim=1)              # float16 均值 (~1.0s)
 ```
 
-#### 4. p90_fast_torch (float16 topk)
+#### 4. HIP 融合内核 (fused_stats_kernel)
 
-```python
-def _p90_fast_torch(t, dim=1):
-    p90_pos = 0.90 * (330 - 1)   # k = 297
-    topk_n = 34                    # 只排最大的 34 个
-    inf = torch.tensor(float("inf"), dtype=torch.float16)
-    filled = torch.where(torch.isnan(t), inf, t)
-    topvals, _ = torch.topk(filled, k=topk_n, dim=dim, largest=True, sorted=True)
-    v0 = topvals[..., -1]; v1 = topvals[..., -2]
-    p90 = v0 + (v1 - v0) * 0.9   # 线性插值
-    return torch.where(torch.isinf(p90), float("nan"), p90)
+自研 HIP kernel，每个线程处理一个 (day, lat, lon) 像素：
+
+```cpp
+// 1. 遍历 330 个 float16 样本，寄存器维护 top-34 (插入排序)
+// 2. 累加 sum + count 计算均值 (跳过 NaN)
+// 3. P90 双线性插值: v0 + (v1-v0)*0.1
+// 4. 64-bit 寻址防止 int32 溢出
+// Grid: (n_lon/256, n_days*rows), Block: (256, 1)
+// 单次内存遍历完成 nanmean + P90，消除 3 次独立 kernel launch
 ```
+
+编译：`torch.utils.cpp_extension.load`，build 目录缓存在 `.fused_kernel/`。首次编译 ~2-3min（hipcc），后续秒加载。
 
 #### 5. 输出保存
 
@@ -180,8 +182,8 @@ def _p90_fast_torch(t, dim=1):
 ## 配置参数
 
 ```python
-N_BANDS = 24           # 纬度分带数 (默认24, 实际用12~16最优)
-SUB_BATCH_DAYS = 46    # 天内批次大小 (92/2=46, 控制 sub tensor 显存)
+N_BANDS = 16           # 纬度分带数 (12~16 最优)
+SUB_BATCH_DAYS = 92    # 天内批次 (HIP kernel 不 OOM，全量处理)
 N_LAT = 721            # 纬度分辨率
 N_LON = 1440           # 经度分辨率
 N_YEARS = 30           # 基线年数 (1991-2020)
@@ -206,30 +208,30 @@ IO_THREADS = 4         # 每 rank I/O 线程数
   - torch.sort 替代 topk：20.3s，更慢，淘汰
   - 结论：torch.nanmean + topk 是最优组合
 **Step 14 — SUB_BATCH_DAYS=46**：把 sub tensor 从 7.3 GiB 降到 3.7 GiB，torch.nanmean 不 OOM
+**Step 15 — HIP 融合内核**：自研 HIP kernel，nanmean + NaN→inf + top-34 P90 单次遍历，Compute 14.5→7.4s
+**Step 16 — 去全量 shm copy**：直接读共享内存，省 3.1s
 
-### 最终性能（MPI, NB=12, SB=46, f16r4n13）
+### 最终性能（MPI, NB=16, SB=92, f16r4n03）
 
 | 阶段 | 时间 | 说明 |
 |------|------|------|
-| Prep | 9s | 文件索引 + 格式探测（不计时） |
-| Setup | 18s | import torch + HIP 初始化（不计时） |
-| I/O | 5.8s | MPI 30 ranks, direct-to-shm (zero gather) |
-| Compute | 14.5s | 4×DCU Z200, topk P90 f16 |
+| Prep | 0.5s | 文件索引 + 格式探测 |
+| Setup | 19s | backend + kernel compile（首次 2-3min） |
+| I/O | 5.4s | MPI 30 ranks, direct-to-shm (zero gather) |
+| Compute | 7.4s | 4×DCU Z200, HIP fused kernel f16 |
 | Save | 1.5s | 92 个 NetCDF |
-| **Total** | **~22s** | I/O+Compute+Save（比赛计时） |
-| **Shell real** | **~60s** | 含 import + prep + setup |
+| **Total** | **14.5s** | I/O+Compute+Save（比赛计时） |
+| **Grand** | **33.5s** | Setup + Total |
+| **Shell real** | **~42s** | 含 import + prep |
 
-### Compute per-band 分解（NB=12, 60 rows/band, SB=46）
+### Compute per-band（HIP fused, NB=16, 45rows/band）
 
-| 操作 | 时间 | 占比 |
-|------|------|------|
-| CPU→GPU 传输 (0.72 GiB) | ~0.3s | 5% |
-| unfold + permute + reshape | ~0.5s | 8% |
-| **topk(k=34, n=330)** | **~4.0s** | **67%** |
-| torch.nanmean | ~1.0s | 17% |
-| GPU→CPU 回传 | ~0.2s | 3% |
+| 操作 | 首band | 后续band |
+|------|--------|---------|
+| CPU→GPU + unfold + kernel | ~3.8s | ~1.1s |
+| GPU→CPU 回传 | ~0.2s | ~0.2s |
 
-> 瓶颈 topk 无法进一步优化（PyTorch AMD kernel 硬件极限）。sort、分带、f16/f32 都已验证。
+> 首 band 含 GPU JIT/冷启动预热，后续全速。每 GPU 4 bands 总 ~7.4s。
 
 ---
 
@@ -241,7 +243,8 @@ IO_THREADS = 4         # 每 rank I/O 线程数
 | f32 4卡 线程并行 | 37s | 29s | — | ~50x |
 | + topk P90 + f16 | 16s | 15s | ~32s | ~60x |
 | + MPI Gather I/O | 14.9s | 7.5s | ~24s | ~70x |
-| **+ Direct-to-shm + torch.nanmean** | **14.5s** | **5.8s** | **~22s** | **~75x** |
+| + Direct-to-shm + torch.nanmean | 14.5s | 5.8s | ~22s | ~75x |
+| **+ HIP fused kernel + no copy** | **7.4s** | **5.4s** | **~14.5s** | **~110x** |
 
 ---
 

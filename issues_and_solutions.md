@@ -218,6 +218,66 @@ export UCX_MEMTYPE_CACHE=n
 
 **结论**：compute 瓶颈 = 单 GPU 的 float16 topk 算力上限。SRM 和 NB 只改变数据切分方式，不改总计算量。无法通过纯调参优化。
 
+### 问题 18：HIP 融合内核编译 — pkg_resources 缺失
+
+**现象**：`load_inline` 报错 `No module named 'pkg_resources'`。
+
+**根因**：waveheat 环境中的 setuptools 82.0.1 已移除 `pkg_resources` 模块。
+
+**解决**：降级 setuptools：
+```bash
+pip install "setuptools<70"
+```
+
+---
+
+### 问题 19：HIP 融合内核编译 — ninja 缺失
+
+**现象**：`load_inline` 报错 `Ninja is required to load C++ extensions`。
+
+**根因**：waveheat 环境缺少 ninja 编译工具。
+
+**解决**：
+```bash
+pip install ninja
+```
+
+---
+
+### 问题 20：load_inline JIT 编译卡死在 Lustre
+
+**现象**：`load_inline` 在 Lustre 文件系统上 hipcc 编译极慢（>3min 无响应）。
+
+**根因**：`load_inline` 写入临时文件到 Lustre，hipcc 编译时大量元数据操作在 Lustre 上极慢。
+
+**解决**：改用 `torch.utils.cpp_extension.load` + 持久化 build 目录：
+- 源码写入 `.fused_kernel/`（持久化目录）
+- ninja 自动检测变化，源码未变则跳过编译（秒加载）
+- SHA256 hash 检测源码变化，自动触发重编译
+
+---
+
+### 问题 21：HIP kernel VMFault — int32 溢出
+
+**现象**：kernel 编译通过，运行时 GPU VMFault crash：
+```
+Invalid address access: 0x2b2a5b50e000, Error code: 1.
+```
+
+**根因**：偏移量计算 `day * (n_total * rows * n_lon)` 中，day=91 时乘积 2,637,835,200 超过 `int32` 上限（2,147,483,647），地址溢出后访问非法内存。
+
+**解决**：所有偏移量计算改用 `long long`（64-bit）。
+
+---
+
+### 问题 22：首 band GPU JIT/冷启动
+
+**现象**：每 GPU 首 band ~3.8s，后续 band ~1.1s。首 band 慢 ~2.5x。
+
+**根因**：GPU kernel 首次启动时触发 HIP 运行时 JIT 编译缓存和 GPU 冷启动延迟。
+
+**解决**：待优化（setup 阶段跑 dummy kernel 预热，预期消除首 band 延迟）。
+
 ---
 
 ## 最终可工作堆栈 (MPI)
@@ -232,6 +292,8 @@ export UCX_MEMTYPE_CACHE=n
 | Python | conda waveheat | 3.10 + mpi4py |
 | 并行方式 | threading 4 线程 + MPI | 各绑 GPU，data 零拷贝 |
 | I/O | raw byte I/O | 直接 seek+read 二进制 |
+| Compute | HIP fused kernel | nanmean + P90 单 pass，7.4s |
+| 编译工具 | ninja + setuptools<70 | HIP kernel JIT 编译 |
 | 验证 | verify_output.py | Python xarray |
 | .pyc 缓存 | PYTHONPYCACHEPREFIX | /tmp/pycache |
 
@@ -251,6 +313,10 @@ export UCX_MEMTYPE_CACHE=n
 10. **PYTHONPYCACHEPREFIX 加速 import**：.pyc 缓存到本地 SSD，避免每次从 Lustre 重新编译
 11. **关闭 core dump**：`ulimit -c 0`，防止 segfault 产生数 GB 的 core 文件
 12. **自动选择空闲节点**：`sinfo` 查 idle 节点 + `--nodelist` 指定，避开已分配节点
+13. **HIP kernel 用 torch.load 而非 load_inline**：持久化 build 目录 + ninja 缓存，避免每次 JIT 编译
+14. **HIP kernel 索引用 64-bit**：`day * n_total * rows * n_lon` 超 INT32_MAX，必须用 long long
+15. **降级 setuptools < 70**：高版本移除 pkg_resources，load/load_inline 依赖它
+16. **HIP 融合 kernel 收益巨大**：nanean + topk 合并为单次遍历，Compute 14.5→7.4s（-49%）
 
 ---
 
@@ -261,42 +327,43 @@ export UCX_MEMTYPE_CACHE=n
 | 逐像素 CPU | 数小时 | — | 数小时 | 1x |
 | f32 4卡 + ProcessPool | 37s | 29s | — | ~50x |
 | topk P90 + f16 | 16s | 15s | ~32s | ~60x |
-| **MPI + raw I/O + f16全程** | **14.9s** | **7.5s** | **~24s** | **~70x** |
+| MPI + raw I/O + f16全程 | 14.9s | 7.5s | ~24s | ~70x |
+| **HIP fused kernel + no copy** | **7.4s** | **5.4s** | **~14.5s** | **~110x** |
 
-### 当前计时拆分 (MPI, f16r4n13)
+### 当前计时拆分 (MPI, NB=16, f16r4n03)
 
-| 阶段 | 时间 | 瓶颈 |
+| 阶段 | 时间 | 说明 |
 |------|------|------|
-| Setup | 18s | import torch + HIP（不计时） |
-| I/O | 7.5s | 5.5s read + 2s MPI gather |
-| Compute | 14.9s | topk P90 占 71%（硬件限制） |
-| Save | 1.6s | 92 个 NetCDF |
-| **Total** | **~24s** | |
+| Setup | 19s | backend + kernel compile（首次 2-3min） |
+| I/O | 5.4s | MPI 30 ranks, direct-to-shm |
+| Compute | 7.4s | 4×DCU, HIP fused kernel f16 |
+| Save | 1.5s | 92 个 NetCDF |
+| **Total** | **14.5s** | I/O+Compute+Save |
 
-### Compute profiling 明细 (per band, 30 rows)
+### Compute per-band（HIP fused, NB=16, 45rows/band）
 
-| 阶段 | 时间 | 占比 |
-|------|------|------|
-| topk(P90) | 1492ms | **71%** |
-| copy+unfold | 310ms | 15% |
-| nanmean(clim) | 160ms | 8% |
-| GPU→CPU+numpy | 116ms | 5% |
-| numpy assign | 24ms | 1% |
+| 操作 | 首band | 后续band |
+|------|--------|---------|
+| CPU→GPU + unfold + kernel | ~3.8s | ~1.1s |
+| GPU→CPU 回传 | ~0.2s | ~0.2s |
 
 ## 并行实现
 
-MPI 30 ranks 分布式 I/O + 4 GPU 线程并行：
+MPI 30 ranks 分布式 I/O + 4 GPU 线程并行 + HIP 融合内核：
 
 ```
 Rank 0-29: 各读 1 年数据 (raw byte I/O)
        │
-       ▼ MPI_Gatherv
-data (5.92 GB, rank 0, float16)
+       ▼ Direct-to-shm (零 gather)
+data (5.92 GB, rank 0, float16, 共享内存)
        │
-       ├── Thread 0: torch.cuda.set_device(0) → GPU 0: 6 bands
-       ├── Thread 1: torch.cuda.set_device(1) → GPU 1: 6 bands
-       ├── Thread 2: torch.cuda.set_device(2) → GPU 2: 6 bands
-       └── Thread 3: torch.cuda.set_device(3) → GPU 3: 6 bands
+       ├── Thread 0: torch.cuda.set_device(0) → GPU 0: 4 bands
+       ├── Thread 1: torch.cuda.set_device(1) → GPU 1: 4 bands
+       ├── Thread 2: torch.cuda.set_device(2) → GPU 2: 4 bands
+       └── Thread 3: torch.cuda.set_device(3) → GPU 3: 4 bands
+       │
+       ▼ HIP fused_stats_kernel (每 band)
+       nanmean + NaN→inf + top-34 P90 单 kernel pass
 ```
 
 ### 并行资源

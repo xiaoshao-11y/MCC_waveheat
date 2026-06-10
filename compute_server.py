@@ -45,7 +45,7 @@ DATE_END = (9, 5)
 
 MAX_READ_WORKERS = int(os.environ.get("MAX_READ_WORKERS", "16"))
 N_BANDS = int(os.environ.get("N_BANDS", "12"))
-SUB_BATCH_DAYS = int(os.environ.get("SUB_BATCH_DAYS", "46"))
+SUB_BATCH_DAYS = int(os.environ.get("SUB_BATCH_DAYS", "92"))
 IO_THREADS = int(os.environ.get("IO_THREADS", "4"))
 
 
@@ -186,33 +186,6 @@ def _detect_backend():
     return num_gpus
 
 
-# ── P90 kernel ─────────────────────────────────────────────────────────────
-
-def _p90_fast_torch(t, dim=1):
-    """float16 topk-based P90 with linear interpolation."""
-    import torch
-    n_time = t.shape[dim]
-    p90_pos = 0.90 * (n_time - 1)
-    k0 = int(p90_pos)
-    topk_n = n_time - k0
-
-    inf = torch.tensor(float("inf"), device=t.device, dtype=t.dtype)
-    filled = torch.where(torch.isnan(t), inf, t)
-    topvals, _ = torch.topk(filled, k=topk_n, dim=dim, largest=True, sorted=True)
-
-    idx = [slice(None)] * t.ndim
-    idx[dim] = -1
-    v0 = topvals[tuple(idx)]
-
-    k1 = min(k0 + 1, n_time - 1)
-    if k1 == k0:
-        p90 = v0
-    else:
-        idx[dim] = -2
-        v1 = topvals[tuple(idx)]
-        p90 = v0 + (v1 - v0) * (p90_pos - k0)
-
-    return torch.where(torch.isinf(p90), float("nan"), p90)
 
 
 # ── GPU compute ────────────────────────────────────────────────────────────
@@ -239,6 +212,25 @@ def _compute_torch(data_np, bands):
     threshold = np.full((N_OUTPUT_DAYS, N_LAT, N_LON), np.nan, dtype=np.float32)
     climatology = np.full((N_OUTPUT_DAYS, N_LAT, N_LON), np.nan, dtype=np.float32)
 
+    # ── Detect P90 backend (quantile vs topk) ────────────────────────────
+    _USE_QUANTILE = False
+    try:
+        torch.quantile(torch.zeros(10, dtype=torch.float16, device="cuda"), 0.9)
+        _USE_QUANTILE = True
+    except RuntimeError:
+        pass
+    print(f"  P90 backend: {'quantile' if _USE_QUANTILE else 'topk (quantile not supported for f16)'}")
+
+    def _p90(sub):
+        """Compute 90th percentile along dim=1. sub modified in-place (NaN→inf)."""
+        sub.nan_to_num_(nan=float("inf"))
+        if _USE_QUANTILE:
+            p90 = torch.quantile(sub, 0.90, dim=1)
+        else:
+            topvals = torch.topk(sub, k=34, dim=1, largest=True, sorted=True).values
+            p90 = topvals[:, -1, :, :] + (topvals[:, -2, :, :] - topvals[:, -1, :, :]) * 0.1
+        return torch.where(torch.isinf(p90), float("nan"), p90)
+
     def _worker(gpu_id, group):
         if not group:
             return
@@ -247,6 +239,7 @@ def _compute_torch(data_np, bands):
         for r0, r1 in group:
             t0 = time.time()
 
+            # .copy() ensures contiguous CPU memory for fast GPU DMA transfer
             band_t = torch.from_numpy(
                 data_np[:, :, r0:r1, :].copy()).to(gpu_id)
             windows = band_t.unfold(dimension=1, size=WINDOW_SIZE, step=1)
@@ -259,15 +252,17 @@ def _compute_torch(data_np, bands):
                     sub = windows[:, d0:d1].permute(1, 0, 4, 2, 3).reshape(
                         n_days, N_YEARS * WINDOW_SIZE, r1 - r0, N_LON)
 
-                    sub_thresh = _p90_fast_torch(sub, dim=1)
-                    sub_clim = torch.nanmean(sub, dim=1)
+                    # nanmean first — small output, frees sub for P90
+                    climatology[d0:d1, r0:r1, :] = (
+                        torch.nanmean(sub, dim=1).cpu().numpy().astype(np.float32))
 
-                    threshold[d0:d1, r0:r1, :] = \
-                        sub_thresh.cpu().numpy().astype(np.float32)
-                    climatology[d0:d1, r0:r1, :] = \
-                        sub_clim.cpu().numpy().astype(np.float32)
+                    # P90: NaN→inf in-place, then quantile or topk
+                    p90 = _p90(sub)
 
-                    del sub, sub_thresh, sub_clim
+                    threshold[d0:d1, r0:r1, :] = (
+                        p90.cpu().numpy().astype(np.float32))
+
+                    del sub, p90
 
             del band_t, windows
             torch.cuda.empty_cache()
