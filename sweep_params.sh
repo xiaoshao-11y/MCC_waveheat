@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-# 参数扫描: SUB_BATCH_DAYS x N_BANDS, 每组合5轮取平均
+# 参数扫描: SUB_BATCH_DAYS x IO_THREADS x SAVE_WORKERS
 # 用法: bash sweep_params.sh
 # ============================================================
 #SBATCH -J sweep
@@ -80,93 +80,102 @@ mkdir -p "${SWEEP_DIR}"
 
 echo "=== sweep start === node=$(hostname) job=${SLURM_JOB_ID}"
 
-# ---- 参数网格 ----
-SBD_GRID="${SBD_GRID:-23 31 46}"
-NB_GRID="${NB_GRID:-24 30}"
-REPEATS="${REPEATS:-5}"
+# ---- 参数网格 (可通过环境变量覆盖) ----
+SBD_GRID="${SBD_GRID:-23 46 92}"
+IO_GRID="${IO_GRID:-1 2 4 6 8}"
+SW_GRID="${SW_GRID:-1 2 4 6 8}"
+REPEATS="${REPEATS:-4}"
 
-echo "SBD_GRID  = ${SBD_GRID}"
-echo "NB_GRID   = ${NB_GRID}"
-echo "REPEATS   = ${REPEATS}"
+echo "SUB_BATCH_DAYS grid = ${SBD_GRID}"
+echo "IO_THREADS grid     = ${IO_GRID}"
+echo "SAVE_WORKERS grid   = ${SW_GRID}"
+echo "REPEATS             = ${REPEATS}"
 
 RESULTS="${SWEEP_DIR}/results.tsv"
-echo -e "combo\tSBD\tNB\trep\ttotal_s\tio_s\tcompute_s\tstatus" > "${RESULTS}"
+echo -e "combo\tSBD\tIO_THREADS\tSW\trep\ttotal_s\tio_s\tcompute_s\tsave_s\tstatus" > "${RESULTS}"
 
 n_combo=0
 run_idx=0
 
 for SBD in ${SBD_GRID}; do
- for NB in ${NB_GRID}; do
-  n_combo=$((n_combo + 1))
-  combo="SBD${SBD}_NB${NB}"
-  echo ""
-  echo "########## combo ${n_combo}: ${combo} ##########"
+ for IOT in ${IO_GRID}; do
+  for SW in ${SW_GRID}; do
+   n_combo=$((n_combo + 1))
+   combo="SBD${SBD}_IO${IOT}_SW${SW}"
+   echo ""
+   echo "########## combo ${n_combo}: ${combo} ##########"
 
-  for rep in $(seq 1 "${REPEATS}"); do
-   run_idx=$((run_idx + 1))
-   rlog="${SWEEP_DIR}/${combo}_r${rep}.log"
+   for rep in $(seq 1 "${REPEATS}"); do
+    run_idx=$((run_idx + 1))
+    rlog="${SWEEP_DIR}/${combo}_r${rep}.log"
 
-   export SUB_BATCH_DAYS="${SBD}"
-   export N_BANDS="${NB}"
+    export SUB_BATCH_DAYS="${SBD}"
+    export IO_THREADS="${IOT}"
+    export SAVE_WORKERS="${SW}"
 
-   echo -n "  rep ${rep}: "
-   set +e
-   mpirun -np 30 python "${CODE_DIR}/compute_server_mpi.py" > "${rlog}" 2>&1
-   rc=$?
-   set -e
+    echo -n "  rep ${rep}: "
+    set +e
+    mpirun -np 30 python "${CODE_DIR}/compute_server_mpi.py" > "${rlog}" 2>&1
+    rc=$?
+    set -e
 
-   if [ "${rc}" -ne 0 ]; then
-     echo "FAILED rc=${rc}"
-     echo -e "${combo}\t${SBD}\t${NB}\t${rep}\tNaN\tNaN\tNaN\tFAIL_rc${rc}" >> "${RESULTS}"
-     continue
-   fi
+    if [ "${rc}" -ne 0 ]; then
+      echo "FAILED rc=${rc}"
+      echo -e "${combo}\t${SBD}\t${IOT}\t${SW}\t${rep}\tNaN\tNaN\tNaN\tNaN\tFAIL_rc${rc}" >> "${RESULTS}"
+      continue
+    fi
 
-   # ---- 解析时间 ----
-   total=$(grep -E '^[[:space:]]*Total:' "${rlog}" | tail -1 | sed -E 's/.*Total:[[:space:]]*([0-9.]+)s.*/\1/')
-   io=$(grep -E '^[[:space:]]*I/O:[[:space:]]+[0-9]' "${rlog}" | tail -1 | sed -E 's/.*I\/O:[[:space:]]*([0-9.]+)s.*/\1/')
-   comp=$(grep -E '^[[:space:]]*Compute:[[:space:]]+[0-9]' "${rlog}" | tail -1 | sed -E 's/.*Compute:[[:space:]]*([0-9.]+)s.*/\1/')
+    # ---- 解析时间 ----
+    total=$(grep -E '^[[:space:]]*Total:' "${rlog}" | tail -1 | sed -E 's/.*Total:[[:space:]]*([0-9.]+)s.*/\1/')
+    io=$(grep -E '^[[:space:]]*I/O:' "${rlog}" | tail -1 | sed -E 's/.*I\/O:[[:space:]]*([0-9.]+)s.*/\1/')
+    comp=$(grep -E '^[[:space:]]*Compute:' "${rlog}" | tail -1 | sed -E 's/.*Compute:[[:space:]]*([0-9.]+)s.*/\1/')
+    save=$(grep -E '^[[:space:]]*Save:' "${rlog}" | tail -1 | sed -E 's/.*Save:[[:space:]]*([0-9.]+)s.*/\1/')
 
-   [ -z "${total}" ] && total="NaN"
-   [ -z "${io}" ] && io="NaN"
-   [ -z "${comp}" ] && comp="NaN"
+    [ -z "${total}" ] && total="NaN"
+    [ -z "${io}" ] && io="NaN"
+    [ -z "${comp}" ] && comp="NaN"
+    [ -z "${save}" ] && save="NaN"
 
-   echo "Total=${total}s  I/O=${io}s  Compute=${comp}s"
-   echo -e "${combo}\t${SBD}\t${NB}\t${rep}\t${total}\t${io}\t${comp}\tOK" >> "${RESULTS}"
+    echo "Total=${total}s  I/O=${io}s  Comp=${comp}s  Save=${save}s"
+    echo -e "${combo}\t${SBD}\t${IOT}\t${SW}\t${rep}\t${total}\t${io}\t${comp}\t${save}\tOK" >> "${RESULTS}"
+   done
   done
  done
 done
 
 echo ""
 echo "============================================================"
-echo "  汇总 (按平均 Compute 升序)"
+echo "  汇总 (按平均 Total 升序)"
 echo "============================================================"
 SUMMARY="${SWEEP_DIR}/summary.csv"
 awk -F'\t' '
   NR==1 { next }
-  $8=="OK" && $7!="NaN" {
-    key=$1; sbd=$2; nb=$3; t=$7+0;
-    sum_t[key]+=$5+0; cnt_t[key]+=1;
-    sum_c[key]+=t; cnt_c[key]+=1;
-    sum_io[key]+=$6+0;
-    SBD[key]=sbd; NB[key]=nb;
+  $10=="OK" && $6!="NaN" {
+    key=$1; sbd=$2+0; iot=$3+0; sw=$4+0; t=$6+0;
+    sum_t[key]+=t; cnt_t[key]+=1;
+    sum_io[key]+=$7+0;
+    sum_c[key]+=$8+0;
+    sum_s[key]+=$9+0;
+    SBD[key]=sbd; IOT[key]=iot; SW[key]=sw;
   }
   END {
-    print "combo,SBD,NB,runs,avg_total_s,avg_io_s,avg_compute_s" > SUMM;
-    for (k in sum_c) {
+    print "combo,SBD,IO_THREADS,SW,runs,avg_total_s,avg_io_s,avg_compute_s,avg_save_s" > SUMM;
+    for (k in sum_t) {
       avg_t = sum_t[k]/cnt_t[k];
-      avg_io = sum_io[k]/cnt_c[k];
-      avg_c = sum_c[k]/cnt_c[k];
-      printf "%s,%s,%s,%d,%.3f,%.3f,%.3f\n", k, SBD[k], NB[k], cnt_c[k], avg_t, avg_io, avg_c >> SUMM;
+      avg_io = sum_io[k]/cnt_t[k];
+      avg_c = sum_c[k]/cnt_t[k];
+      avg_s = sum_s[k]/cnt_t[k];
+      printf "%s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f\n", k, SBD[k], IOT[k], SW[k], cnt_t[k], avg_t, avg_io, avg_c, avg_s >> SUMM;
     }
   }
-' SUMM="${SUMMARY}" "${RESULTS}" | sort -t',' -k7 -n | tee "${SWEEP_DIR}/leaderboard.txt"
+' SUMM="${SUMMARY}" "${RESULTS}" | sort -t',' -k5 -n | tee "${SWEEP_DIR}/leaderboard.txt"
 
 # 格式化打印
 echo ""
-echo " 排名  SBD   NB   runs  avg_total   avg_io    avg_compute"
-echo " ────────────────────────────────────────────────────────"
+echo " 排名  组合                       runs  avg_total   avg_io    avg_comp   avg_save"
+echo " ────────────────────────────────────────────────────────────────────────────────"
 awk -F',' 'NR>1 {
-  printf "  %2d   %-4s %-4s %-4s  %-8s   %-8s  %-8s\n", NR-1, $2, $3, $4, $5, $6, $7
+  printf "  %2d   %-24s %-4s   %-8s   %-8s  %-8s  %-8s\n", NR-1, $1, $5, $6, $7, $8, $9
 }' "${SUMMARY}"
 
 BEST=$(head -1 "${SWEEP_DIR}/leaderboard.txt" 2>/dev/null)

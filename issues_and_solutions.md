@@ -263,13 +263,52 @@ Invalid address access: 0x2b2a5b50e000, Error code: 1.
 
 ---
 
-### 问题 22：首 band GPU JIT/冷启动
+### 问题 22：首 band GPU JIT/冷启动 — 已解决
 
 **现象**：每 GPU 首 band ~3.8s，后续 band ~1.1s。首 band 慢 ~2.5x。
 
 **根因**：GPU kernel 首次启动时触发 HIP 运行时 JIT 编译缓存和 GPU 冷启动延迟。
 
-**解决**：待优化（setup 阶段跑 dummy kernel 预热，预期消除首 band 延迟）。
+**解决**：Setup 阶段（不计时）在每 GPU 上跑一个 dummy kernel 预热：
+```python
+for gpu_id in range(num_gpus):
+    with torch.cuda.device(gpu_id):
+        d = torch.zeros(1, 330, 16, 256, dtype=torch.float16, device=gpu_id)
+        p = torch.empty(1, 16, 256, dtype=torch.float32, device=gpu_id)
+        m = torch.empty(1, 16, 256, dtype=torch.float32, device=gpu_id)
+        fused_fn(d, p, m)
+torch.cuda.synchronize()
+```
+首 band 从 3.8s → 1.7s，Compute 7.4→4.7s（-36%）。
+
+---
+
+### 问题 23：并行 Save — multiprocessing fork COW
+
+**现象**：Save 92 个 NetCDF 文件需 ~1.5s。
+
+**根因**：单进程串行写 92 个文件。但 ThreadPoolExecutor 不可用（HDF5 线程不安全，见问题 10）。
+
+**解决**：multiprocessing fork + COW：
+```python
+ctx = mp.get_context("fork")
+with ctx.Pool(processes=N_SAVE_WORKERS) as pool:
+    pool.map(_save_chunk, chunks)
+```
+- `fork` 在 GPU 初始化前完成，子进程继承父进程内存（COW），零数据复制开销
+- 每子进程有独立 HDF5 状态，天然线程安全
+- 4 进程并行写，Save 1.5→1.0s
+
+---
+
+### 问题 24：参数扫描确定最优值
+
+**现象**：不确定 IO_THREADS、SAVE_WORKERS、SUB_BATCH_DAYS 最优值。
+
+**解决**：`sweep_params.sh` 全量扫描 75 组合 × 4 轮：
+- IO_THREADS=2 最优（4/8 导致 Lustre MDS 过载）
+- SAVE_WORKERS=4 最优（更多进程无帮助，Lustre MDS 瓶颈）
+- SUB_BATCH_DAYS=92 全量处理（HIP kernel 不 OOM 时不需分批）
 
 ---
 
@@ -321,23 +360,24 @@ Invalid address access: 0x2b2a5b50e000, Error code: 1.
 | f32 4卡 + ProcessPool | 37s | 29s | — | ~50x |
 | topk P90 + f16 | 16s | 15s | ~32s | ~60x |
 | MPI + raw I/O + f16全程 | 14.9s | 7.5s | ~24s | ~70x |
-| **HIP fused kernel + no copy** | **7.4s** | **5.4s** | **~14.5s** | **~110x** |
+| **HIP fused kernel + no copy** | 7.4s | 5.4s | ~14.5s | ~110x |
+| **+ GPU warmup + parallel save** | **4.7s** | **5.5-7.0s** | **~11.5-13.0s** | **~140x** |
 
-### 当前计时拆分 (MPI, NB=16, f16r4n03)
+### 当前计时拆分 (MPI, NB=12, n03)
 
 | 阶段 | 时间 | 说明 |
 |------|------|------|
-| Setup | 19s | backend + kernel compile（首次 2-3min） |
-| I/O | 5.4s | MPI 30 ranks, direct-to-shm |
-| Compute | 7.4s | 4×DCU, HIP fused kernel f16 |
-| Save | 1.5s | 92 个 NetCDF |
-| **Total** | **14.5s** | I/O+Compute+Save |
+| Setup | ~2s | backend + kernel load（首次编译 ~20s） |
+| I/O | 5.5-7.0s | MPI 30 ranks, direct-to-shm, Lustre 波动 |
+| Compute | 4.7s | 4×DCU, HIP fused kernel + GPU 预热 |
+| Save | 1.0s | 92 个 NetCDF, 4 进程 fork COW |
+| **Total** | **11.5-13.0s** | I/O+Compute+Save |
 
-### Compute per-band（HIP fused, NB=16, 45rows/band）
+### Compute per-band（HIP fused, NB=12, GPU 预热后）
 
 | 操作 | 首band | 后续band |
 |------|--------|---------|
-| CPU→GPU + unfold + kernel | ~3.8s | ~1.1s |
+| CPU→GPU + unfold + kernel | ~1.7s | ~1.3s |
 | GPU→CPU 回传 | ~0.2s | ~0.2s |
 
 ## 并行实现

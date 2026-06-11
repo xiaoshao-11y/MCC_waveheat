@@ -45,8 +45,8 @@ sdp/
        │
        ▼
   ┌────────────────────────────────────┐
-  │  Setup: backend 检测 + import torch │  ← ~19s, 不计时
-  │  + HIP kernel 编译/加载             │
+  │  Setup: backend 检测 + import torch │  ← ~2s（首次 ~20s）, 不计时
+  │  + HIP kernel 编译/加载 + GPU 预热   │
   └────────────────────────────────────┘
        │
        ▼  ─── total_start (计时起点) ───
@@ -54,7 +54,7 @@ sdp/
   ┌────────────────────────────────────┐
   │  MPI 分布式 I/O                     │  ← 30 ranks, raw byte seek+read
   │  每 rank 独立读 1 年 ~102 文件       │
-  │  float16 直读 (5.69 GB)             │    ~5.4s
+  │  float16 直读 (5.92 GB)             │    ~5.5-7.0s (Lustre 波动)
   │  direct-to-shm (零 gather)          │    各 rank 直接写共享内存
   └────────────────────────────────────┘
        │
@@ -70,15 +70,15 @@ sdp/
   │  N_BANDS bands ÷ 4 GPUs            │
   │  unfold(dim=1, size=11, step=1)     │    零拷贝窗口
   │  permute(1,0,4,2,3).reshape()      │    单次连续拷贝
-  │  HIP fused kernel (f16)            │    ~7.4s
+  │  HIP fused kernel (f16)            │    ~4.7s (GPU 预热后)
   │    nanmean + NaN→inf + top-34 P90  │    单 kernel 完成
   └────────────────────────────────────┘
        │
        ▼  threshold, climatology: (92, 721, 1440) float32
        │
   ┌────────────────────────────────────┐
-  │  Save: 92 个 .nc 文件               │  ← netCDF4 Dataset, float32
-  │  Climatology/MMDD.nc                │    ~1.5s
+  │  Save: 92 个 .nc 文件               │  ← netCDF4, 4 进程 fork COW
+  │  Climatology/MMDD.nc                │    ~1.0s
   └────────────────────────────────────┘
        │
        ▼
@@ -96,14 +96,14 @@ sdp/
 │ │ MPI 启动 + Python import (~5s)            │ │
 │ │ ┌──────────────────────────────────────┐ │ │
 │ │ │ main()                                │ │ │
-│ │ │   Prep   (0.5s)  ← 不计时            │ │ │
-│ │ │   Setup (19s)   ← 不计时             │ │ │
+│ │ │   Prep   (0.3s)  ← 不计时            │ │ │
+│ │ │   Setup (~2s)   ← 不计时             │ │ │
 │ │ │   ─── total_start ───                │ │ │
-│ │ │   I/O    (5.4s)                      │ │ │
-│ │ │   Compute(7.4s)                      │ │ │
-│ │ │   Save   (1.5s)                      │ │ │
+│ │ │   I/O    (5.5-7.0s)                  │ │ │
+│ │ │   Compute(4.7s)                      │ │ │
+│ │ │   Save   (1.0s)                      │ │ │
 │ │ │   ─── total_elapsed ───              │ │ │
-│ │ │   Total: 14.5s   (I/O → save end)    │ │ │
+│ │ │   Total: 11.5-13.0s (I/O→save end)   │ │ │
 │ │ │   Validation  ← 不计时                │ │ │
 │ │ └──────────────────────────────────────┘ │ │
 │ └──────────────────────────────────────────┘ │
@@ -168,25 +168,41 @@ N_BANDS bands 轮询分配到 4 GPU
 
 编译：`torch.utils.cpp_extension.load`，build 目录缓存在 `.fused_kernel/`。首次编译 ~2-3min（hipcc），后续秒加载。
 
-#### 5. 输出保存
+#### 5. 输出保存（并行 fork COW）
 
 - 格式：NetCDF4，float32 编码
 - 变量：`Climmean`, `P90_sst`, `dayofyear`
 - 维度：`[Lat, Lon]`（721×1440）
+- multiprocessing fork: COW 继承内存，4 进程并行写，零数据复制
+
+#### 6. GPU 预热
+
+```python
+# Setup 阶段（不计时），每 GPU 跑 dummy kernel 预编译 HIP kernel
+for gpu_id in range(num_gpus):
+    with torch.cuda.device(gpu_id):
+        d = torch.zeros(1, 330, 16, 256, dtype=torch.float16, device=gpu_id)
+        p = torch.empty(1, 16, 256, dtype=torch.float32, device=gpu_id)
+        m = torch.empty(1, 16, 256, dtype=torch.float32, device=gpu_id)
+        fused_fn(d, p, m)
+torch.cuda.synchronize()
+```
+消除 HIP kernel 首次启动 JIT 编译开销，Compute 7.4→4.7s。
 
 ---
 
 ## 配置参数
 
 ```python
-N_BANDS = 16           # 纬度分带数 (12~16 最优)
+N_BANDS = 12           # 纬度分带数 (参数扫描最优，每 GPU 3 bands)
 SUB_BATCH_DAYS = 92    # 天内批次 (HIP kernel 不 OOM，全量处理)
 N_LAT = 721            # 纬度分辨率
 N_LON = 1440           # 经度分辨率
 N_YEARS = 30           # 基线年数 (1991-2020)
 N_OUTPUT_DAYS = 92     # 输出天数 (6/1 ~ 8/31, DOY 152-243)
 WINDOW_SIZE = 11       # 滑动窗口 (5+1+5)
-IO_THREADS = 4         # 每 rank I/O 线程数
+IO_THREADS = 2         # 每 rank I/O 线程数 (参数扫描最优)
+SAVE_WORKERS = 4       # 并行写 nc 文件的进程数
 ```
 
 ---

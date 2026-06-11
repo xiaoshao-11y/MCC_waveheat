@@ -50,7 +50,7 @@ DATE_END = (9, 5)
 
 N_BANDS = int(os.environ.get("N_BANDS", "12"))
 SUB_BATCH_DAYS = int(os.environ.get("SUB_BATCH_DAYS", "92"))
-IO_THREADS = int(os.environ.get("IO_THREADS", "4"))
+IO_THREADS = int(os.environ.get("IO_THREADS", "2"))
 
 
 # ── Calendar helpers ───────────────────────────────────────────────────────
@@ -625,6 +625,7 @@ def main():
     print(f"\nComputing threshold & climatology "
           f"({N_OUTPUT_DAYS} days x 30-year sliding window) ...")
     bands = build_bands()
+
     t_compute = time.time()
     threshold, climatology = _compute_torch(data, bands, fused_fn)
     compute_elapsed = time.time() - t_compute
