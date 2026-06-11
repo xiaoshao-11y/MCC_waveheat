@@ -437,6 +437,60 @@ def build_bands():
     return bands
 
 
+# ── Parallel save (multiprocessing, fork COW) ──────────────────────────────
+
+_save_threshold = None
+_save_climatology = None
+_save_lats = None
+_save_lons = None
+_save_out_dir = None
+_save_d0 = None
+
+
+def _save_chunk(args):
+    """Write a subset of output files. Called via multiprocessing fork.
+
+    Accesses module-level globals (_save_*) set by main() before fork.
+    Each child inherits parent memory via COW — no data copy overhead.
+    """
+    start_idx, end_idx = args
+    from netCDF4 import Dataset as NCDataset
+    from datetime import timedelta
+    import numpy as np
+
+    for out_idx in range(start_idx, end_idx):
+        doy = 152 + out_idx
+        dt = _save_d0 + timedelta(days=doy - 1)
+        fname = dt.strftime("%m%d.nc")
+
+        with NCDataset(_save_out_dir / fname, "w", format="NETCDF4") as nc:
+            nc.createDimension("Lat", N_LAT)
+            nc.createDimension("Lon", N_LON)
+            nc.createDimension("Day", 1)
+
+            v_lat = nc.createVariable("Lat", "f4", ("Lat",))
+            v_lat[:] = _save_lats
+            v_lat.long_name = "Latitude"
+
+            v_lon = nc.createVariable("Lon", "f4", ("Lon",))
+            v_lon[:] = _save_lons
+            v_lon.long_name = "Longitude"
+
+            v_clim = nc.createVariable("Climmean", "f4", ("Lat", "Lon"))
+            v_clim[:] = np.ascontiguousarray(_save_climatology[out_idx])
+            v_clim.long_name = "OSTIA SST climatology 1991-2020"
+
+            v_p90 = nc.createVariable("P90_sst", "f4", ("Lat", "Lon"))
+            v_p90[:] = np.ascontiguousarray(_save_threshold[out_idx])
+            v_p90.long_name = "90th percentile of precipitation"
+
+            v_doy = nc.createVariable("dayofyear", "i4", ("Day",))
+            v_doy[:] = doy
+            v_doy.long_name = "Day of year (1-365, no 29Feb)"
+
+            nc.baseline_period = "1991-2020"
+
+
 # ── Main ───────────────────────────────────────────────────────────────────
 
 def main():
@@ -489,6 +543,23 @@ def main():
         t_setup = time.time()
         num_gpus = _detect_backend()
         fused_fn = _load_fused_kernel()
+
+        # Warmup: pre-compile GPU kernels on every GPU to avoid JIT
+        # overhead during timed compute (saves ~2.5s, see Problem 22)
+        if fused_fn is not None:
+            import torch
+            for gpu_id in range(num_gpus):
+                with torch.cuda.device(gpu_id):
+                    d = torch.zeros(1, 330, 16, 256,
+                                    dtype=torch.float16, device=gpu_id)
+                    p = torch.empty(1, 16, 256,
+                                    dtype=torch.float32, device=gpu_id)
+                    m = torch.empty(1, 16, 256,
+                                    dtype=torch.float32, device=gpu_id)
+                    fused_fn(d, p, m)
+            torch.cuda.synchronize()
+            print("  GPU warmup:    done")
+
         setup_time = time.time() - t_setup
     else:
         num_gpus, setup_time = 0, 0.0
@@ -561,43 +632,40 @@ def main():
 
     del data; gc.collect()
 
-    # ── Save ──
+    # ── Save (parallel via multiprocessing fork) ──
     print("\nSaving ...")
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # DOY 152 = Jun 1 in a non-leap year (equivalent to 365-day calendar)
-    d0_2019 = datetime(2019, 1, 1)  # 2019 is not a leap year
-    for out_idx in range(N_OUTPUT_DAYS):
-        doy = 152 + out_idx                       # Jun 1 = DOY 152
-        dt = d0_2019 + timedelta(days=doy - 1)
-        fname = dt.strftime("%m%d.nc")
+    import multiprocessing as mp
 
-        with Dataset(OUT_DIR / fname, "w", format="NETCDF4") as nc:
-            nc.createDimension("Lat", N_LAT)
-            nc.createDimension("Lon", N_LON)
-            nc.createDimension("Day", 1)
+    N_SAVE_WORKERS = int(os.environ.get("SAVE_WORKERS", "4"))
+    N_SAVE_WORKERS = min(N_SAVE_WORKERS, N_OUTPUT_DAYS)
 
-            v_lat = nc.createVariable("Lat", "f4", ("Lat",))
-            v_lat[:] = lats
-            v_lat.long_name = "Latitude"
+    # Populate module-level globals for worker processes (COW, no copy)
+    global _save_threshold, _save_climatology, _save_lats, _save_lons
+    global _save_out_dir, _save_d0
+    _save_threshold = threshold
+    _save_climatology = climatology
+    _save_lats = lats
+    _save_lons = lons
+    _save_out_dir = OUT_DIR
+    _save_d0 = datetime(2019, 1, 1)  # DOY 152 = Jun 1 (non-leap year)
 
-            v_lon = nc.createVariable("Lon", "f4", ("Lon",))
-            v_lon[:] = lons
-            v_lon.long_name = "Longitude"
+    # Build evenly-sized chunks
+    base, rem = divmod(N_OUTPUT_DAYS, N_SAVE_WORKERS)
+    chunks, idx = [], 0
+    for w in range(N_SAVE_WORKERS):
+        sz = base + (1 if w < rem else 0)
+        if sz > 0:
+            chunks.append((idx, idx + sz))
+            idx += sz
 
-            v_clim = nc.createVariable("Climmean", "f4", ("Lat", "Lon"))
-            v_clim[:] = np.ascontiguousarray(climatology[out_idx])
-            v_clim.long_name = "OSTIA SST climatology 1991-2020"
-
-            v_p90 = nc.createVariable("P90_sst", "f4", ("Lat", "Lon"))
-            v_p90[:] = np.ascontiguousarray(threshold[out_idx])
-            v_p90.long_name = "90th percentile of precipitation"
-
-            v_doy = nc.createVariable("dayofyear", "i4", ("Day",))
-            v_doy[:] = doy
-            v_doy.long_name = "Day of year (1-365, no 29Feb)"
-
-            nc.baseline_period = "1991-2020"
+    if N_SAVE_WORKERS > 1:
+        ctx = mp.get_context("fork")
+        with ctx.Pool(processes=N_SAVE_WORKERS) as pool:
+            pool.map(_save_chunk, chunks)
+    else:
+        _save_chunk((0, N_OUTPUT_DAYS))
 
     t_end = time.time()
     total_elapsed = t_end - t_io
