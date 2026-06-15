@@ -10,18 +10,16 @@
 
 ```
 sdp/
-├── compute_server.py          # ProcessPool 版本（备用，24 workers）
-├── compute_server_mpi.py      # MPI 版本（主流程，30 ranks + 4GPU）
+├── compute_server_mpi.py      # MPI + 4GPU + HIP 融合内核（主流程）
 ├── verify_output.py           # Python 版验证脚本
-├── get_climatology.sh         # SLURM 提交脚本（自动选节点，USE_MPI=1）
-├── sweep_params.sh            # 参数扫描脚本
+├── get_climatology.sh         # SLURM 提交脚本（自动选节点）
+
 ├── issues_and_solutions.md    # 问题与解决方案
 ├── architecture.md            # 本文档
 ├── readme.md                  # 项目进度与规划
 ├── ERA5/
 │   └── Climatology/           # 输出 (92个 .nc 文件)
-├── logs/                      # SLURM 任务日志
-└── verification/              # 验证结果
+└── logs/                      # SLURM 任务日志
 ```
 
 ---

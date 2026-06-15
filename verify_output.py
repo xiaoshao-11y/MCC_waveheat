@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""验证 compute_server.py 的输出与参考标准的一致性（RMSE）。
+"""验证输出与参考标准的一致性（RMSE）。
    替代 clim_verification.m，无需 MATLAB。
 """
 import numpy as np

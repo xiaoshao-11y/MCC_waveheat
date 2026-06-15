@@ -14,7 +14,7 @@ from pathlib import Path
 from netCDF4 import Dataset
 import numpy as np
 
-# Default matches compute_server.py DATA_DIR
+# Default DATA_DIR matching compute_server_mpi.py
 DEFAULT_DATA_DIR = "/public/home/achwjznh4b/Newdata/"
 
 # SST variable names to try (in order of preference)

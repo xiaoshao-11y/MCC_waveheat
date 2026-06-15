@@ -102,10 +102,6 @@ module load compiler/dtk/24.04 2>/dev/null || module load dtk 2>/dev/null || tru
 export LD_LIBRARY_PATH=/public/software/compiler/rocm/dtk-24.04/lib:/public/software/compiler/rocm/dtk-24.04/hip/lib:${LD_LIBRARY_PATH}
 export ROCM_PATH=${ROCM_PATH:-/public/software/compiler/rocm/dtk-24.04}
 export HIP_VISIBLE_DEVICES=0,1,2,3
-export MAX_READ_WORKERS=24
-
-# ---- MPI mode (set USE_MPI=1 before calling this script) ----
-USE_MPI="${USE_MPI:-0}"
 MPI_NP="${MPI_NP:-30}"
 
 # ---- PyTorch HIP alloc conf (ROCm memory tuning) ----
@@ -118,18 +114,13 @@ CONDA_ENV=/public/home/pan2174/install/miniconda3/envs/waveheat
 export PATH="${CONDA_ENV}/bin:${PATH}"
 export LD_LIBRARY_PATH="${CONDA_ENV}/lib:${LD_LIBRARY_PATH}"
 
-if [ "${USE_MPI}" = "1" ]; then
-    # ---- Intel MPI / ROMIO tuning for Lustre ----
-    export ROMIO_CB_READ=enable
-    export ROMIO_DS_READ=enable
-    export CB_BUFFER_SIZE=4194304
+# ---- Intel MPI / ROMIO tuning for Lustre ----
+export ROMIO_CB_READ=enable
+export ROMIO_DS_READ=enable
+export CB_BUFFER_SIZE=4194304
 
-    # Load Intel MPI module (already loaded by ls/run_climatology.sh:35)
-    module load mpi/hpcx/2.7.4/gcc-7.3.1 2>/dev/null || true
+# Load Intel MPI module (already loaded by ls/run_climatology.sh:35)
+module load mpi/hpcx/2.7.4/gcc-7.3.1 2>/dev/null || true
 
-    echo ">>> MPI mode: mpirun -np ${MPI_NP}"
-    { time mpirun -np "${MPI_NP}" python /public/home/pan2174/sdp/compute_server_mpi.py; } 2>&1
-else
-    echo ">>> ProcessPool mode: MAX_READ_WORKERS=${MAX_READ_WORKERS}"
-    { time python /public/home/pan2174/sdp/compute_server.py; } 2>&1
-fi
+echo ">>> MPI mode: mpirun -np ${MPI_NP}"
+{ time mpirun -np "${MPI_NP}" python /public/home/pan2174/sdp/compute_server_mpi.py; } 2>&1
