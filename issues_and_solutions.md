@@ -265,21 +265,26 @@ Invalid address access: 0x2b2a5b50e000, Error code: 1.
 
 ### 问题 22：首 band GPU JIT/冷启动 — 已解决
 
-**现象**：每 GPU 首 band ~3.8s，后续 band ~1.1s。首 band 慢 ~2.5x。
+**现象**：每 GPU 首 band ~3.5s，后续 band ~1.4s。首 band 慢 ~2.5x。
 
 **根因**：GPU kernel 首次启动时触发 HIP 运行时 JIT 编译缓存和 GPU 冷启动延迟。
 
-**解决**：Setup 阶段（不计时）在每 GPU 上跑一个 dummy kernel 预热：
+**解决**：Setup 阶段（不计时）在每 GPU 上用真实 band 尺寸跑 dummy kernel 预热：
 ```python
+row_sizes = sorted(set(r1 - r0 for r0, r1 in build_bands()))
 for gpu_id in range(num_gpus):
     with torch.cuda.device(gpu_id):
-        d = torch.zeros(1, 330, 16, 256, dtype=torch.float16, device=gpu_id)
-        p = torch.empty(1, 16, 256, dtype=torch.float32, device=gpu_id)
-        m = torch.empty(1, 16, 256, dtype=torch.float32, device=gpu_id)
-        fused_fn(d, p, m)
+        for rows in row_sizes:
+            d = torch.zeros(1, N_YEARS * WINDOW_SIZE, rows, N_LON,
+                            dtype=torch.float16, device=gpu_id)
+            p = torch.empty(1, rows, N_LON,
+                            dtype=torch.float32, device=gpu_id)
+            m = torch.empty(1, rows, N_LON,
+                            dtype=torch.float32, device=gpu_id)
+            fused_fn(d, p, m)
 torch.cuda.synchronize()
 ```
-首 band 从 3.8s → 1.7s，Compute 7.4→4.7s（-36%）。
+必须用真实 band 尺寸（n_rows × 1440），否则 grid_x/grid_y 不匹配导致预热无效。首 band 从 3.5s → 2.4s，Compute 7.4→5.5s（-26%）。
 
 ---
 
@@ -324,7 +329,7 @@ with ctx.Pool(processes=N_SAVE_WORKERS) as pool:
 | Python | conda waveheat | 3.10 + mpi4py |
 | 并行方式 | threading 4 线程 + MPI | 各绑 GPU，data 零拷贝 |
 | I/O | raw byte I/O | 直接 seek+read 二进制 |
-| Compute | HIP fused kernel | nanmean + P90 单 pass，7.4s |
+| Compute | HIP fused kernel | nanmean + P90 单 pass，5.5s |
 | 编译工具 | ninja + setuptools<70 | HIP kernel JIT 编译 |
 | 验证 | verify_output.py | Python xarray |
 | .pyc 缓存 | PYTHONPYCACHEPREFIX | /tmp/pycache |
@@ -361,23 +366,23 @@ with ctx.Pool(processes=N_SAVE_WORKERS) as pool:
 | topk P90 + f16 | 16s | 15s | ~32s | ~60x |
 | MPI + raw I/O + f16全程 | 14.9s | 7.5s | ~24s | ~70x |
 | **HIP fused kernel + no copy** | 7.4s | 5.4s | ~14.5s | ~110x |
-| **+ GPU warmup + parallel save** | **4.7s** | **5.5-7.0s** | **~11.5-13.0s** | **~140x** |
+| **+ GPU warmup + parallel save** | **5.5s** | **5.5-7.0s** | **~12.0-13.5s** | **~140x** |
 
-### 当前计时拆分 (MPI, NB=12, n03)
+### 当前计时拆分 (MPI, NB=12, n13/n12)
 
 | 阶段 | 时间 | 说明 |
 |------|------|------|
 | Setup | ~2s | backend + kernel load（首次编译 ~20s） |
 | I/O | 5.5-7.0s | MPI 30 ranks, direct-to-shm, Lustre 波动 |
-| Compute | 4.7s | 4×DCU, HIP fused kernel + GPU 预热 |
+| Compute | 5.5s | 4×DCU, HIP fused kernel + GPU 预热 |
 | Save | 1.0s | 92 个 NetCDF, 4 进程 fork COW |
-| **Total** | **11.5-13.0s** | I/O+Compute+Save |
+| **Total** | **12.0-13.5s** | I/O+Compute+Save |
 
 ### Compute per-band（HIP fused, NB=12, GPU 预热后）
 
 | 操作 | 首band | 后续band |
 |------|--------|---------|
-| CPU→GPU + unfold + kernel | ~1.7s | ~1.3s |
+| CPU→GPU + unfold + kernel | ~2.4s | ~1.4s |
 | GPU→CPU 回传 | ~0.2s | ~0.2s |
 
 ## 并行实现
