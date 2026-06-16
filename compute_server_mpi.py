@@ -544,19 +544,21 @@ def main():
         num_gpus = _detect_backend()
         fused_fn = _load_fused_kernel()
 
-        # Warmup: pre-compile GPU kernels on every GPU to avoid JIT
-        # overhead during timed compute (saves ~2.5s, see Problem 22)
+        # Warmup: pre-compile HIP kernel on every GPU before timing.
+        # Use ALL band sizes to cover every grid_x/grid_y combination.
         if fused_fn is not None:
             import torch
+            row_sizes = sorted(set(r1 - r0 for r0, r1 in build_bands()))
             for gpu_id in range(num_gpus):
                 with torch.cuda.device(gpu_id):
-                    d = torch.zeros(1, 330, 16, 256,
-                                    dtype=torch.float16, device=gpu_id)
-                    p = torch.empty(1, 16, 256,
-                                    dtype=torch.float32, device=gpu_id)
-                    m = torch.empty(1, 16, 256,
-                                    dtype=torch.float32, device=gpu_id)
-                    fused_fn(d, p, m)
+                    for rows in row_sizes:
+                        d = torch.zeros(1, N_YEARS * WINDOW_SIZE, rows, N_LON,
+                                        dtype=torch.float16, device=gpu_id)
+                        p = torch.empty(1, rows, N_LON,
+                                        dtype=torch.float32, device=gpu_id)
+                        m = torch.empty(1, rows, N_LON,
+                                        dtype=torch.float32, device=gpu_id)
+                        fused_fn(d, p, m)
             torch.cuda.synchronize()
             print("  GPU warmup:    done")
 
