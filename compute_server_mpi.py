@@ -48,7 +48,7 @@ N_OUTPUT_DAYS = N_DAYS_PER_YEAR - WINDOW_SIZE + 1       # 92 (Jun 1 – Aug 31)
 DATE_START = (5, 27)
 DATE_END = (9, 5)
 
-N_BANDS = int(os.environ.get("N_BANDS", "16"))
+N_BANDS = int(os.environ.get("N_BANDS", "12"))
 SUB_BATCH_DAYS = int(os.environ.get("SUB_BATCH_DAYS", "92"))
 IO_THREADS = int(os.environ.get("IO_THREADS", "2"))
 
