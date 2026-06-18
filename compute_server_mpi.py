@@ -860,8 +860,36 @@ def main():
 
         fused_fn, accumulate_fn, finalize_fn, accumulate_batch_fn = _load_fused_kernel()
         streaming_ok = accumulate_fn is not None
+
+        # Micro-warmup: warm only the kernel path actually used.
+        if streaming_ok:
+            for gpu_id in range(num_gpus):
+                with torch.cuda.device(gpu_id):
+                    yr = torch.zeros(102, 1, N_LON,
+                                     dtype=torch.float16, device=gpu_id)
+                    top34 = torch.full((1, 1, N_LON, 34),
+                                       float('-inf'), dtype=torch.float16,
+                                       device=gpu_id)
+                    ps = torch.zeros(1, 1, N_LON,
+                                     dtype=torch.float32, device=gpu_id)
+                    pc = torch.zeros(1, 1, N_LON,
+                                     dtype=torch.int32, device=gpu_id)
+                    accumulate_fn(yr, top34, ps, pc)
+            torch.cuda.synchronize()
+        elif fused_fn is not None:
+            for gpu_id in range(num_gpus):
+                with torch.cuda.device(gpu_id):
+                    d = torch.zeros(1, N_YEARS * WINDOW_SIZE, 1, N_LON,
+                                    dtype=torch.float16, device=gpu_id)
+                    p = torch.empty(1, 1, N_LON,
+                                    dtype=torch.float32, device=gpu_id)
+                    m = torch.empty(1, 1, N_LON,
+                                    dtype=torch.float32, device=gpu_id)
+                    fused_fn(d, p, m)
+            torch.cuda.synchronize()
+
         setup_time = time.time() - t_setup
-        print(f"  Setup:          {setup_time:.1f}s  (kernel compile, no warmup)")
+        print(f"  Setup:          {setup_time:.1f}s")
     else:
         num_gpus, setup_time = 0, 0.0
         fused_fn, accumulate_fn, finalize_fn, accumulate_batch_fn = None, None, None, None
@@ -1017,7 +1045,7 @@ def main():
     print(f"  TIMING BREAKDOWN (MPI, float16, {mode_label})")
     print(f"{'='*60}")
     print(f"  Prep:       {prep_elapsed:8.1f}s   (imports + file index + format probe)")
-    print(f"  Setup:      {setup_time:8.1f}s   (kernel compile)")
+    print(f"  Setup:      {setup_time:8.1f}s   (kernel compile + micro-warmup)")
     if streaming_ok:
         print(f"  I/O:        {io_elapsed:8.1f}s   (MPI distributed, 30 ranks)")
         print(f"  Compute:    {compute_total:8.1f}s  "
