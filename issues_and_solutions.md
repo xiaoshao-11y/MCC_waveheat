@@ -269,7 +269,7 @@ Invalid address access: 0x2b2a5b50e000, Error code: 1.
 
 **根因**：GPU kernel 首次启动时触发 HIP 运行时 JIT 编译缓存和 GPU 冷启动延迟。
 
-**解决**：Setup 阶段（不计时）在每 GPU 上用真实 band 尺寸跑 dummy kernel 预热：
+**解决**：Setup 阶段在每 GPU 上用真实 band 尺寸跑 dummy kernel 预热：
 ```python
 row_sizes = sorted(set(r1 - r0 for r0, r1 in build_bands()))
 for gpu_id in range(num_gpus):
@@ -306,6 +306,28 @@ with ctx.Pool(processes=N_SAVE_WORKERS) as pool:
 
 ---
 
+### 问题 25：边读边算流水线 — I/O 与 Compute 重叠
+
+**现象**：Competition 22-27s，其中 Compute 8-11s 必须等 30 个 rank 全部完成 I/O（5.4-7.5s）后才能开始，两者完全串行。
+
+**根因**：P90/top-34 和均值对年份具备结合律（可先算 15 年的部分 top-34，再与另外 15 年合并），但原始实现是一次性将 30 年 330 天输入 fused kernel，必须等 I/O 全完成。
+
+**解决**：实现边读边算流水线，将 Compute 与 I/O 重叠：
+
+1. **新 HIP 内核**：将 `fused_stats_kernel`（一次处理 330 个样本）拆分为：
+   - `accumulate_year_kernel`：每年调用一次，将单年 11 天窗口数据累加到持久化 top-34/sum/count 状态（寄存器驻留，每线程 11 次迭代），~67ms/年
+   - `finalize_kernel`：从累积状态计算最终 P90 和 mean，<1ms/band
+
+2. **就绪标志同步**：MPI 共享内存扩展 30 字节 `ready_flags[]` int8 数组（在 data 数组之后，加 64 字节 padding 防伪共享）。每个 rank 读完自己的年份后设置 `ready_flags[yr_idx]=1`。单节点 x86 共享物理页，写操作对所有进程立即可见。
+
+3. **线程架构**：rank 0 在 I/O 开始前启动 4 个 GPU 工作线程。每线程轮询 `ready_flags`（1ms 间隔），年份就绪即复制到 GPU 并启动 `accumulate_year_kernel`。30 年全部就绪后调用 `finalize_kernel` 得到 P90/mean。
+
+4. **降级安全**：如果 HIP 新内核编译失败 → `streaming_ok=False` → 自动回退到原始 `_compute_torch()` 批量计算路径。
+
+**效果**：Competition 22-27s → 18.1s（-18%~-33%）：
+- 首轮 band 的 7.0s 计算完全被 I/O（6.8s）覆盖
+- 仅剩第 2/3 轮 band 的 3.3s 计算尾量在 I/O 完成后执行
+
 ### 问题 24：参数扫描确定最优值
 
 **现象**：不确定 IO_THREADS、SAVE_WORKERS、SUB_BATCH_DAYS 最优值。
@@ -329,7 +351,7 @@ with ctx.Pool(processes=N_SAVE_WORKERS) as pool:
 | Python | conda waveheat | 3.10 + mpi4py |
 | 并行方式 | threading 4 线程 + MPI | 各绑 GPU，data 零拷贝 |
 | I/O | raw byte I/O | 直接 seek+read 二进制 |
-| Compute | HIP fused kernel | nanmean + P90 单 pass，5.5s |
+| Compute | HIP streaming kernels | accumulate_year + finalize, I/O 重叠 |
 | 编译工具 | ninja + setuptools<70 | HIP kernel JIT 编译 |
 | 验证 | verify_output.py | Python xarray |
 | .pyc 缓存 | PYTHONPYCACHEPREFIX | /tmp/pycache |
@@ -359,50 +381,121 @@ with ctx.Pool(processes=N_SAVE_WORKERS) as pool:
 
 ## 性能演进
 
-| 版本 | Compute | I/O | Total | 加速 |
-|------|---------|-----|-------|------|
-| 逐像素 CPU | 数小时 | — | 数小时 | 1x |
-| f32 4卡 + ProcessPool | 37s | 29s | — | ~50x |
-| topk P90 + f16 | 16s | 15s | ~32s | ~60x |
-| MPI + raw I/O + f16全程 | 14.9s | 7.5s | ~24s | ~70x |
-| **HIP fused kernel + no copy** | 7.4s | 5.4s | ~14.5s | ~110x |
-| **+ GPU warmup + parallel save** | **5.5s** | **5.5-7.0s** | **~12.0-13.5s** | **~140x** |
+| 版本 | Compute | I/O | 备注 |
+|------|---------|-----|------|
+| 逐像素 CPU | 数小时 | — | 原始实现 |
+| f32 4卡 + ProcessPool | 37s | 29s | 首次 GPU 加速 |
+| topk P90 + f16 | 16s | 15s | ~32s Total（老计时） |
+| MPI + raw I/O + f16全程 | 14.9s | 7.5s | ~24s Total |
+| **HIP fused kernel + no copy** | 7.4s | 5.4s | ~14.5s Total |
+| **+ GPU warmup + parallel save** | 5.5s | 5.5-7.0s | ~12s Total（老计时，不含 Prep/Setup） |
+| **比赛规则适配** | 8-11s | 5.4-7.5s | **~22-27s Competition** |
+| **边读边算流水线（当前）** | 10.3s | 6.8s | **~18.1s Competition**（I/O 与 Compute 重叠）|
 
-### 当前计时拆分 (MPI, NB=12, n13/n12)
+### 当前计时拆分 (边读边算流水线, NB=12, WH=5, f16r4n13)
 
-| 阶段 | 时间 | 说明 |
-|------|------|------|
-| Setup | ~2s | backend + kernel load（首次编译 ~20s） |
-| I/O | 5.5-7.0s | MPI 30 ranks, direct-to-shm, Lustre 波动 |
-| Compute | 5.5s | 4×DCU, HIP fused kernel + GPU 预热 |
-| Save | 1.0s | 92 个 NetCDF, 4 进程 fork COW |
-| **Total** | **12.0-13.5s** | I/O+Compute+Save |
+| 阶段 | 时间 | 占比 | 说明 |
+|------|------|------|------|
+| Prep | ~1.6s | 9% | imports + 路径构造 + 格式探测 + MPI window |
+| Setup | ~5.0s | 28% | HIP kernel 编译 + 4 GPU micro-warmup（accumulate kernel） |
+| I/O | ~6.8s | — | MPI 30 ranks, raw byte I/O, direct-to-shm（与 Compute 重叠） |
+| Compute | ~10.3s | — | 4×DCU Z200 流式（7.0s 在 I/O 阶段 + 3.3s tail） |
+| Save | ~1.2s | 7% | 92 个 NetCDF, 4 进程 fork COW |
+| **Competition** | **~18.1s** | — | = Prep + Setup + I/O + compute_tail + Save |
 
-### Compute per-band（HIP fused, NB=12, GPU 预热后）
+Competition = 1.6 + 5.0 + 6.8 + 3.3 + 1.2 ≈ 18.1s。Compute 的 7.0s 被 I/O 完全覆盖。
 
-| 操作 | 首band | 后续band |
-|------|--------|---------|
-| CPU→GPU + unfold + kernel | ~2.4s | ~1.4s |
-| GPU→CPU 回传 | ~0.2s | ~0.2s |
-
-## 并行实现
-
-MPI 30 ranks 分布式 I/O + 4 GPU 线程并行 + HIP 融合内核：
+### 18s 时间构成详解
 
 ```
-Rank 0-29: 各读 1 年数据 (raw byte I/O)
-       │
-       ▼ Direct-to-shm (零 gather)
-data (5.92 GB, rank 0, float16, 共享内存)
-       │
-       ├── Thread 0: torch.cuda.set_device(0) → GPU 0: 4 bands
-       ├── Thread 1: torch.cuda.set_device(1) → GPU 1: 4 bands
-       ├── Thread 2: torch.cuda.set_device(2) → GPU 2: 4 bands
-       └── Thread 3: torch.cuda.set_device(3) → GPU 3: 4 bands
-       │
-       ▼ HIP fused_stats_kernel (每 band)
-       nanmean + NaN→inf + top-34 P90 单 kernel pass
+时间轴 ──────────────────────────────────────────────────────────►
+
+  0s    1.6s       6.6s                             13.4s  14.6s  18.1s
+  │ Prep │  Setup   │                               │      │      │
+  │      │          │          I/O (6.8s)            │ tail │ Save  │
+  │      │          │                                │(3.3s)│(1.2s)│
+  │      │          ├────────────────────────────────┤      │      │
+  │      │          │  Compute round 1 (7.0s)        │ r2,r3│      │
+  │      │          │  ← 被 I/O 完全覆盖 →           │      │      │
+  │      │          │                                │      │      │
+  ▼      ▼          ▼                                ▼      ▼      ▼
+ start  Prep       GPU                               I/O    全GPU  Competition
+        完成       threads                         Barrier  完成   结束
+                  启动                              (6.8s)
 ```
+
+### Compute per-GPU per-band（流式模式, 3 bands/GPU）
+
+| GPU 线程 | Band 1 | Band 2 | Band 3 | 完成时间 |
+|----------|--------|--------|--------|---------|
+| GPU 0 (bands 0-2) | ~2.3s（被 I/O 覆盖） | ~2.4s（被 I/O 覆盖） | ~2.5s（I/O 后） | ~10.3s |
+| GPU 1 (bands 3-5) | ~2.3s（被 I/O 覆盖） | ~2.4s（I/O 后） | ~2.4s（I/O 后） | ~10.3s |
+| GPU 2-3 | 类似 | 类似 | 类似 | ~10.3s |
+
+每 band 处理：30 年 × accumulate_year_kernel（~67ms/年） + finalize（<1ms） + GPU↔CPU 传输。
+
+### 首轮 vs 后续 band 为什么流式模式下差距缩小
+
+原始 fused kernel 需要 unfold+permute+reshape 重组数据（首 band 5-6s，后续 1.4-2.5s）。流式 accumulate kernel 直接读 year slice 无需重组，per-band 时间更均匀（~2.3-2.5s），首 band 无额外 JIT 开销。
+
+## 流式并行实现
+
+### 总体架构
+
+```
+                    MPI 30 ranks
+               ┌─────────────────────────────────────────┐
+               │ Rank 0-29: 逐年读取文件                     │
+               │ 读完一年 → ready_flags[year_idx] = 1     │
+               │ Direct-to-shm (零 gather)                 │
+               └──────────────┬──────────────────────────┘
+                              │
+          data (5.92 GB, rank 0, float16, 共享内存)
+          ready_flags[30] int8 (64B padding 后，共享内存)
+                              │
+         ┌────────────────────┴────────────────────┐
+         │          Rank 0: 4 GPU 工作线程          │
+         │  Thread 0: GPU 0 → 轮询 ready_flags     │
+         │  Thread 1: GPU 1 → 年份就绪即累加       │
+         │  Thread 2: GPU 2 → 30年齐→finalize      │
+         │  Thread 3: GPU 3 → D2H→写结果           │
+         └─────────────────────────────────────────┘
+```
+
+### 内核设计
+
+**accumulate_year_kernel** — 每个 (day, lat, lon) 线程处理 1 年 11 天窗口：
+- 从全局内存加载持久化状态到寄存器（top34[34] + sum + count）
+- 遍历 11 天滑动窗口，在寄存器中做 NaN 检查和 top-34 插入排序
+- 写回持久化状态（一次全局读 + 一次全局写）
+- 每线程仅 11 次迭代（vs 原始 fused kernel 的 330 次）
+- ~67ms/年/band
+
+**finalize_kernel** — 每 band 调用一次：
+- 从累积 top34/sum/count 计算最终 P90 和 mean
+- <1ms/band
+
+### 同步机制
+
+```
+ready_flags: int8[30] @ MPI shared memory offset=total_bytes+64
+
+Rank N (任意): 读完第 Y 年 → ready_flags[Y] = 1  (plain store, x86 TSO)
+Rank 0 GPU 线程: while remaining > 0:
+                   for yr in range(30):
+                     if ready_flags[yr] && !processed[yr]:
+                       复制 year 切片到 GPU → accumulate_year_kernel()
+                       processed[yr] = True
+                   sleep(1ms)
+```
+
+无需原子操作或内存屏障：x86 TSO 保证 plain store 对所有核可见；1ms 轮询间隔足够（rank I/O 粒度为年级别，~100-300ms/年）。
+
+### 正确性保证：P90 和 mean 的跨年结合律
+
+- **mean**：`(sum1+sum2)/(cnt1+cnt2)` — 直接可结合
+- **P90/top-34**：从 30 年 330 个样本中取 top-34 = 从每年 11 个样本中逐步筛选 top-34 — 可逐步插入到持久化 top-34 数组
+- **NaN 处理**：NaN → +inf → 落入 top-34 顶部 → 不影响 P90 计算（最终用 count 校验）
 
 ### 并行资源
 
@@ -412,4 +505,4 @@ data (5.92 GB, rank 0, float16, 共享内存)
 | CPU 核心 (-n) | 32 | 64 | ✓ |
 | DCU 卡 | 4 | 单机 4 卡 | ✓ |
 | MPI ranks | 30 | — | ✓ |
-| 时间 | ~14.5s | 2h | ✓ |
+| 时间 | ~18.1s | 2h | ✓ |

@@ -30,53 +30,49 @@ sdp/
 
 **float16 全程**。存储用 float16（5.92 GB），GPU 上 float16 直接输入 HIP 融合 kernel（nanmean + P90 单 pass）。不转 float32，消除额外 kernel launch。RMSE < 0.001°C，满足赛题要求。
 
-### 数据流
+### 数据流（边读边算流水线）
 
 ```
 原始数据文件 (3060 个 .nc, 30年 × 102天)
        │
        ▼
   ┌────────────────────────────────────┐
-  │  Prep: 文件索引 + 格式探测           │  ← ~0.5s, 不计时
+  │  Prep: 文件索引 + 格式探测           │  ← 1.6s
   │  探测 raw byte I/O offset           │
   └────────────────────────────────────┘
        │
        ▼
   ┌────────────────────────────────────┐
-  │  Setup: backend 检测 + import torch │  ← ~2s（首次 ~20s）, 不计时
-  │  + HIP kernel 编译/加载 + GPU 预热   │
+  │  Setup: backend 检测                │  ← 5.0s
+  │  + HIP 4 kernels 编译               │    accumulate_year + finalize
+  │  + 4 GPU 条件 micro-warmup          │    + fused_stats + batch (备用)
   └────────────────────────────────────┘
        │
-       ▼  ─── total_start (计时起点) ───
+       ▼  ─── t_io (计时起点) ───
        │
+  ┌──────────────────────────┬─────────────────────────────────────┐
+  │  MPI 分布式 I/O (30 ranks)│  Rank 0: 4 GPU 工作线程 (并行)      │
+  │                          │                                     │
+  │  逐年读取:                │  Thread 0→GPU 0: 轮询 ready_flags   │
+  │  Rank N 读年第 Y 年      │    年份就绪 → copy year→GPU →       │
+  │    102 files raw I/O     │    accumulate_year_kernel (~67ms/年) │
+  │    → data[Y,:,r0:r1,:]  │    30 年齐 → finalize_kernel         │
+  │  ready_flags[Y] = 1 ────→    D2H → 写结果到 threshold/clim     │
+  │                          │                                     │
+  │  ~6.8s                   │  ~7.0s (被 I/O 覆盖) + 3.3s tail    │
+  └──────────────────────────┴─────────────────────────────────────┘
+       │                          │
+       ▼  comm.Barrier()         ▼
   ┌────────────────────────────────────┐
-  │  MPI 分布式 I/O                     │  ← 30 ranks, raw byte seek+read
-  │  每 rank 独立读 1 年 ~102 文件       │
-  │  float16 直读 (5.92 GB)             │    ~5.5-7.0s (Lustre 波动)
-  │  direct-to-shm (零 gather)          │    各 rank 直接写共享内存
-  └────────────────────────────────────┘
-       │
-       ▼  data: (30, 102, 721, 1440) float16 (共享内存)
-       │
-  ┌────────────────────────────────────┐
-  │  跳过全量 copy，shm 直接读            │  ← band 级 .copy() 保证 DMA 连续
-  └────────────────────────────────────┘
-       │
-       ▼
-  ┌────────────────────────────────────┐
-  │  Compute: _compute_torch            │  ← 4 卡线程并行
-  │  N_BANDS bands ÷ 4 GPUs            │
-  │  unfold(dim=1, size=11, step=1)     │    零拷贝窗口
-  │  permute(1,0,4,2,3).reshape()      │    单次连续拷贝
-  │  HIP fused kernel (f16)            │    ~4.7s (GPU 预热后)
-  │    nanmean + NaN→inf + top-34 P90  │    单 kernel 完成
+  │  Rank 0: join GPU threads          │  ← compute tail ~3.3s
+  │  非 rank 0: return                  │
   └────────────────────────────────────┘
        │
        ▼  threshold, climatology: (92, 721, 1440) float32
        │
   ┌────────────────────────────────────┐
   │  Save: 92 个 .nc 文件               │  ← netCDF4, 4 进程 fork COW
-  │  Climatology/MMDD.nc                │    ~1.0s
+  │  Climatology/MMDD.nc                │    ~1.2s
   └────────────────────────────────────┘
        │
        ▼
@@ -85,27 +81,33 @@ sdp/
   └────────────────────────────────────┘
 ```
 
-### 计时架构
+### 计时架构（边读边算流水线）
 
 ```
 ┌──────────────────────────────────────────────┐
 │ Shell { time mpirun ... }                     │
 │ ┌──────────────────────────────────────────┐ │
-│ │ MPI 启动 + Python import (~5s)            │ │
+│ │ MPI 启动 + Python import + torch.cuda.init │ │
 │ │ ┌──────────────────────────────────────┐ │ │
-│ │ │ main()                                │ │ │
-│ │ │   Prep   (0.3s)  ← 不计时            │ │ │
-│ │ │   Setup (~2s)   ← 不计时             │ │ │
-│ │ │   ─── total_start ───                │ │ │
-│ │ │   I/O    (5.5-7.0s)                  │ │ │
-│ │ │   Compute(4.7s)                      │ │ │
-│ │ │   Save   (1.0s)                      │ │ │
-│ │ │   ─── total_elapsed ───              │ │ │
-│ │ │   Total: 11.5-13.0s (I/O→save end)   │ │ │
+│ │ │ main()  _t0 = time.time()            │ │ │
+│ │ │   Prep   1.6s  (imports + index +     │ │ │
+│ │ │                 format probe + window)│ │ │
+│ │ │   Setup  5.0s  (kernel compile +      │ │ │
+│ │ │                 micro-warmup 4 GPUs)  │ │ │
+│ │ │   ─── t_io ───                       │ │ │
+│ │ │   ┌───────────────┐                  │ │ │
+│ │ │   │ I/O   6.8s    │ ← 与 Compute 重叠 │ │ │
+│ │ │   │ Compute 7.0s  │   (首轮 band)    │ │ │
+│ │ │   └───────────────┘                  │ │ │
+│ │ │   Barrier + join threads             │ │ │
+│ │ │   Compute tail 3.3s (第2/3轮 band)    │ │ │
+│ │ │   Save   1.2s                        │ │ │
+│ │ │   ─── t_end ───                      │ │ │
+│ │ │   Competition: 18.1s                  │ │ │
 │ │ │   Validation  ← 不计时                │ │ │
 │ │ └──────────────────────────────────────┘ │ │
 │ └──────────────────────────────────────────┘ │
-│ Shell real: ~42s (含 import + prep + setup)  │
+│ Shell real: ~42s (含 import + MPI 启动)      │
 └──────────────────────────────────────────────┘
 ```
 
@@ -135,36 +137,61 @@ def read_one_year_raw(year, file_list, offset, n_bytes, shape, dtype):
 - 不复制全量 shm→heap，band 级 `.copy()` 直接确保 GPU DMA 连续性
 - 预建路径字典，零 stat 调用
 
-#### 3. 多 GPU 线程并行
+#### 3. 多 GPU 流式线程并行（边读边算）
 
 ```
-策略: 线程共享数据 + 各绑 GPU
+策略: 4 线程共享 MPI 共享内存 + 各绑 GPU + 轮询 ready_flags
 
 N_BANDS bands 轮询分配到 4 GPU
-每 GPU 3-4 bands (45-61 rows/band)
+每 GPU 3 bands (60 rows/band)
 
 每 band 内:
-  band_t = torch.from_numpy(data_np[:,:,r0:r1,:].copy()).to(gpu_id)  # .copy() 确保连续
-  windows = band_t.unfold(dim=1, size=11, step=1)   # 零拷贝滑动视图
-  with torch.inference_mode():
-    sub = windows.permute(1,0,4,2,3).reshape(92, 330, rows, 1440)
-    fused_fn(sub, p90_gpu, mean_gpu)               # HIP 融合 kernel (~1.1s)
+  // 分配持久化 GPU 状态
+  top34 = zeros(92, rows, 1440, 34) float16  (初始化为 -inf)
+  partial_sum = zeros(92, rows, 1440) float32
+  partial_count = zeros(92, rows, 1440) int32
+  year_gpu = empty(102, rows, 1440) float16  (预分配, 复用 30 次)
+
+  // 轮询年份就绪
+  while remaining > 0:
+    for yr in range(30):
+      if ready_flags[yr] and not processed[yr]:
+        year_gpu.copy_(data[yr, :, r0:r1, :])  // CPU→GPU
+        accumulate_fn(year_gpu, top34, partial_sum, partial_count)
+        processed[yr] = True; remaining--
+    if remaining > 0: sleep(1ms)
+
+  // 30 年齐: finalize
+  finalize_fn(top34, partial_sum, partial_count, p90_gpu, mean_gpu)
+  threshold[:, r0:r1, :] = p90_gpu.cpu()  // GPU→CPU
+  climatology[:, r0:r1, :] = mean_gpu.cpu()
 ```
 
-#### 4. HIP 融合内核 (fused_stats_kernel)
+**降级路径**: 如果 HIP 流式内核编译失败 → `streaming_ok=False` → 回退到 `_compute_torch()` 原始批量 fused kernel 路径。
 
-自研 HIP kernel，每个线程处理一个 (day, lat, lon) 像素：
+#### 4. HIP 流式内核
+
+**accumulate_year_kernel** — 每年每 band 调用一次（共 30 次/band）：
 
 ```cpp
-// 1. 遍历 330 个 float16 样本，寄存器维护 top-34 (插入排序)
-// 2. 累加 sum + count 计算均值 (跳过 NaN)
-// 3. P90 双线性插值: v0 + (v1-v0)*0.1
-// 4. 64-bit 寻址防止 int32 溢出
+// 寄存器加载持久化状态 (top34[34] + sum + count)
+// 遍历单年 11 天滑动窗口 (vs 原始 330 天)
+// NaN→+inf 后插入排序维护 top-34 (纯寄存器)
+// 写回持久化状态
 // Grid: (n_lon/256, n_days*rows), Block: (256, 1)
-// 单次内存遍历完成 nanmean + P90，消除 3 次独立 kernel launch
+// ~67ms/年/band（每线程仅 11 次迭代 vs 原始 330 次）
 ```
 
-编译：`torch.utils.cpp_extension.load`，build 目录缓存在 `.fused_kernel/`。首次编译 ~2-3min（hipcc），后续秒加载。
+**finalize_kernel** — 每 band 调用一次：
+
+```cpp
+// 从 top34/sum/count 计算: mean = sum/count, P90 = top[33] + (top[32]-top[33])*0.1
+// <1ms/band
+```
+
+**保留内核**：`fused_stats_kernel`（原始批量内核，降级回退用）和 `accumulate_batch_kernel`（未使用，测试中因 np.stack 开销淘汰）。
+
+编译：`torch.utils.cpp_extension.load`，4 个内核编译在一起，build 目录缓存在 `.fused_kernel/`。首次编译 ~2-3min（hipcc），后续秒加载。SHA256 源码 hash 检测变化自动重编译。
 
 #### 5. 输出保存（并行 fork COW）
 
@@ -173,34 +200,51 @@ N_BANDS bands 轮询分配到 4 GPU
 - 维度：`[Lat, Lon]`（721×1440）
 - multiprocessing fork: COW 继承内存，4 进程并行写，零数据复制
 
-#### 6. GPU 预热
+#### 6. 条件 GPU 预热
 
 ```python
-# Setup 阶段（不计时），每 GPU 跑 dummy kernel 预编译 HIP kernel
-for gpu_id in range(num_gpus):
-    with torch.cuda.device(gpu_id):
-        d = torch.zeros(1, 330, 16, 256, dtype=torch.float16, device=gpu_id)
-        p = torch.empty(1, 16, 256, dtype=torch.float32, device=gpu_id)
-        m = torch.empty(1, 16, 256, dtype=torch.float32, device=gpu_id)
-        fused_fn(d, p, m)
-torch.cuda.synchronize()
+# Setup 阶段, 仅预热实际使用的内核路径
+if streaming_ok:
+    # 流式模式: 预热 accumulate kernel (1 行, 全经度)
+    for gpu_id in range(num_gpus):
+        with torch.cuda.device(gpu_id):
+            yr = torch.zeros(102, 1, N_LON, dtype=torch.float16, device=gpu_id)
+            top34 = torch.full((1, 1, N_LON, 34), float('-inf'),
+                               dtype=torch.float16, device=gpu_id)
+            ps = torch.zeros(1, 1, N_LON, dtype=torch.float32, device=gpu_id)
+            pc = torch.zeros(1, 1, N_LON, dtype=torch.int32, device=gpu_id)
+            accumulate_fn(yr, top34, ps, pc)
+    torch.cuda.synchronize()
+elif fused_fn is not None:
+    # 降级模式: 预热 fused kernel
+    for gpu_id in range(num_gpus):
+        with torch.cuda.device(gpu_id):
+            d = torch.zeros(1, N_YEARS * WINDOW_SIZE, 1, N_LON,
+                            dtype=torch.float16, device=gpu_id)
+            p = torch.empty(1, 1, N_LON, dtype=torch.float32, device=gpu_id)
+            m = torch.empty(1, 1, N_LON, dtype=torch.float32, device=gpu_id)
+            fused_fn(d, p, m)
+    torch.cuda.synchronize()
 ```
-消除 HIP kernel 首次启动 JIT 编译开销，Compute 7.4→4.7s。
+
+必须使用真实 band 的经度尺寸（N_LON=1440），否则 grid_x 维度不匹配导致预热无效。每 GPU ~1.2s，总计 ~5.0s Setup。消除 HIP kernel 首次启动 JIT 编译开销。
 
 ---
 
 ## 配置参数
 
 ```python
-N_BANDS = 12           # 纬度分带数 (参数扫描最优，每 GPU 3 bands)
-SUB_BATCH_DAYS = 92    # 天内批次 (HIP kernel 不 OOM，全量处理)
-N_LAT = 721            # 纬度分辨率
-N_LON = 1440           # 经度分辨率
-N_YEARS = 30           # 基线年数 (1991-2020)
-N_OUTPUT_DAYS = 92     # 输出天数 (6/1 ~ 8/31, DOY 152-243)
-WINDOW_SIZE = 11       # 滑动窗口 (5+1+5)
-IO_THREADS = 2         # 每 rank I/O 线程数 (参数扫描最优)
-SAVE_WORKERS = 4       # 并行写 nc 文件的进程数
+N_BANDS = 12            # 纬度分带数 (参数扫描最优，每 GPU 3 bands)
+SUB_BATCH_DAYS = 92     # 天内批次 (HIP kernel 不 OOM，全量处理)
+N_LAT = 721             # 纬度分辨率
+N_LON = 1440            # 经度分辨率
+N_YEARS = 30            # 基线年数 (1991-2020)
+N_OUTPUT_DAYS = 92      # 输出天数 (6/1 ~ 8/31, DOY 152-243)
+WINDOW_SIZE = 11        # 滑动窗口 (5+1+5)
+IO_THREADS = 2          # 每 rank I/O 线程数 (参数扫描最优)
+SAVE_WORKERS = 4        # 并行写 nc 文件的进程数
+FLAGS_PAD = 64          # ready_flags 偏移 padding 防伪共享
+FLAGS_COUNT = 30        # ready_flags 条目数 (一年一个)
 ```
 
 ---
