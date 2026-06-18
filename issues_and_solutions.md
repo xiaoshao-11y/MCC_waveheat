@@ -352,6 +352,16 @@ with ctx.Pool(processes=N_SAVE_WORKERS) as pool:
 
 **结论**：对于滑动窗口聚合类计算，按最外层维度（年）做流式累加是最优的——利用结合律在寄存器中逐步累积，每个数据元素只处理一次。细化粒度的思路虽然缩短了首次结果延迟，但由于窗口重叠导致的冗余计算抵消了全部 I/O 重叠收益。**此方案永久淘汰。**
 
+### 问题 27：并行 warmup 4 GPU 同时预热 — 淘汰
+
+**现象**：尝试将 Setup 中的串行 4 GPU warmup 改为 4 线程并行，期望 Setup 从 5.0s 降到 ~2.0s。结果 Setup 从 5.0s 涨到 10.3s，Competition 从 18.1s 涨到 27.7s。
+
+**根因**：HIP 驱动层的 kernel ISA 加载/指令缓存写入在多 GPU 间存在驱动级锁，4 线程并行时产生锁竞争，反而比串行更慢。每 GPU warmup ~1.2s，但并行时变成了 4 线程抢锁，每个从 1.2s 膨胀到 ~2.5s。
+
+**结论**：HIP 多 GPU 预热必须串行。驱动层的 GPU 二进制到指令缓存的加载操作是不可并行化的硬件/驱动限制。**此方案永久淘汰。**
+
+---
+
 ### 问题 24：参数扫描确定最优值
 
 **现象**：不确定 IO_THREADS、SAVE_WORKERS、SUB_BATCH_DAYS 最优值。
@@ -403,6 +413,7 @@ with ctx.Pool(processes=N_SAVE_WORKERS) as pool:
 17. **利用结合律实现边读边算**：P90/top-34 和 mean 跨年份可结合，将单一 fused kernel 拆为 per-year accumulate + finalize，使 GPU 计算与 I/O 重叠，Competition 22-27s → 18.1s
 18. **MPI 共享内存天然适合流式同步**：int8 ready_flags 数组在共享物理页上，写操作对所有 rank 立即可见，无需显式同步原语
 19. **流式粒度不是越细越好**：per-day（1 文件）vs per-year（102 文件）因滑动窗口重叠导致 11 倍 GPU 冗余读取，compute 从 10.3s 涨到 15.5s。对于窗口聚合，应选最外层维度做流式——利用结合律，每元素只处理一次
+20. **HIP 多 GPU 预热必须串行**：驱动层 kernel ISA 加载存在锁竞争，4 线程并行 warmup（期望 ~2s）反而膨胀到 ~10s
 
 ---
 
