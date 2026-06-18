@@ -55,7 +55,7 @@ SUB_BATCH_DAYS = int(os.environ.get("SUB_BATCH_DAYS", "92"))
 IO_THREADS = int(os.environ.get("IO_THREADS", "2"))
 
 FLAGS_PAD = 64
-FLAGS_COUNT = N_DAYS_PER_YEAR  # 102 — one ready flag per day (per-day streaming)
+FLAGS_COUNT = N_YEARS  # 30 — one ready flag per year
 
 
 # ── Calendar helpers ───────────────────────────────────────────────────────
@@ -743,87 +743,6 @@ def _compute_streaming(data, ready_flags, bands, accumulate_fn, finalize_fn,
     return threads, threshold, climatology
 
 
-# ── Per-day streaming compute (I/O–Compute overlap at day granularity) ─────
-
-def _compute_streaming_by_day(data, ready_flags, bands, fused_fn, num_gpus):
-    """Per-day streaming GPU compute: one output day at a time via fused_stats_kernel.
-
-    Returns (threads, threshold, climatology). Caller must join threads.
-    Each GPU thread pre-allocates the full 102-day window, copies day slices
-    as they become ready, and computes output days as their 11-day windows
-    complete using the existing fused_stats_kernel (n_days=1, n_total=330).
-    """
-    import torch
-    import threading
-    import time as _time
-
-    band_groups = [[] for _ in range(num_gpus)]
-    for i, band in enumerate(bands):
-        band_groups[i % num_gpus].append(band)
-
-    threshold = np.full((N_OUTPUT_DAYS, N_LAT, N_LON), np.nan, dtype=np.float32)
-    climatology = np.full((N_OUTPUT_DAYS, N_LAT, N_LON), np.nan, dtype=np.float32)
-
-    def _worker(gpu_id, group):
-        if not group:
-            return
-        torch.cuda.set_device(gpu_id)
-        rows_total = sum(r1 - r0 for (r0, r1) in group)
-
-        with torch.cuda.device(gpu_id):
-            # Pre-allocate full 102-day window on GPU
-            gpu_data = torch.empty(N_YEARS, N_DAYS_PER_YEAR, rows_total, N_LON,
-                                   dtype=torch.float16, device=gpu_id)
-            # Per-day I/O: copy arriving day slices for my band rows
-            for day_idx in range(N_DAYS_PER_YEAR):
-                while ready_flags[day_idx] == 0:
-                    _time.sleep(0.0005)  # 0.5ms poll interval
-
-                # Copy this day's data for all my bands
-                col_offset = 0
-                for r0, r1 in group:
-                    rows = r1 - r0
-                    day_cpu = torch.from_numpy(
-                        np.ascontiguousarray(data[:, day_idx, r0:r1, :]))
-                    gpu_data[:, day_idx, col_offset:col_offset + rows, :].copy_(day_cpu)
-                    col_offset += rows
-
-                # Check if any output day's window just completed
-                if day_idx >= WINDOW_HALF * 2:
-                    od = day_idx - WINDOW_HALF * 2  # = day_idx - 10
-
-                    col_offset = 0
-                    for r0, r1 in group:
-                        rows = r1 - r0
-                        # Extract window: data[:, od:od+11, rows, lon]
-                        window = gpu_data[:, od:od + WINDOW_SIZE,
-                                          col_offset:col_offset + rows, :]
-                        # Reorder to (1, 330, rows, n_lon) for fused_stats_kernel
-                        sub = window.permute(1, 0, 2, 3).reshape(
-                            1, N_YEARS * WINDOW_SIZE, rows, N_LON).contiguous()
-
-                        p90_gpu = torch.empty(1, rows, N_LON,
-                                              dtype=torch.float32, device=gpu_id)
-                        mean_gpu = torch.empty(1, rows, N_LON,
-                                               dtype=torch.float32, device=gpu_id)
-                        fused_fn(sub, p90_gpu, mean_gpu)
-
-                        threshold[od, r0:r1, :] = p90_gpu[0].cpu().numpy()
-                        climatology[od, r0:r1, :] = mean_gpu[0].cpu().numpy()
-                        col_offset += rows
-
-            del gpu_data
-        torch.cuda.empty_cache()
-
-    threads = []
-    for gid, group in enumerate(band_groups):
-        t = threading.Thread(target=_worker, args=(gid, group))
-        t.start()
-        threads.append(t)
-
-    return threads, threshold, climatology
-
-
 # ── Latitude bands ─────────────────────────────────────────────────────────
 
 def build_bands():
@@ -944,16 +863,18 @@ def main():
 
         # Micro-warmup: warm only the kernel path actually used.
         if streaming_ok:
-            # Per-day streaming uses fused_stats_kernel (n_days=1, n_total=330)
             for gpu_id in range(num_gpus):
                 with torch.cuda.device(gpu_id):
-                    d = torch.zeros(1, N_YEARS * WINDOW_SIZE, 1, N_LON,
-                                    dtype=torch.float16, device=gpu_id)
-                    p = torch.empty(1, 1, N_LON,
-                                    dtype=torch.float32, device=gpu_id)
-                    m = torch.empty(1, 1, N_LON,
-                                    dtype=torch.float32, device=gpu_id)
-                    fused_fn(d, p, m)
+                    yr = torch.zeros(102, 1, N_LON,
+                                     dtype=torch.float16, device=gpu_id)
+                    top34 = torch.full((1, 1, N_LON, 34),
+                                       float('-inf'), dtype=torch.float16,
+                                       device=gpu_id)
+                    ps = torch.zeros(1, 1, N_LON,
+                                     dtype=torch.float32, device=gpu_id)
+                    pc = torch.zeros(1, 1, N_LON,
+                                     dtype=torch.int32, device=gpu_id)
+                    accumulate_fn(yr, top34, ps, pc)
             torch.cuda.synchronize()
         elif fused_fn is not None:
             for gpu_id in range(num_gpus):
@@ -989,23 +910,14 @@ def main():
     if rank == 0:
         ready_flags[:] = 0
 
-    # ── Build per-day file mapping for per-day streaming ──
-    # my_day_files[day_idx] = [(yr_idx, fp), ...] for this rank
-    my_day_files = [[] for _ in range(N_DAYS_PER_YEAR)]
-    for yr in my_years:
-        yr_idx = int(yr) - START_YEAR
-        for day_idx, (slot, fp) in enumerate(by_year[yr]):
-            my_day_files[day_idx].append((yr_idx, fp))
-
-    day_count_target = N_DAYS_PER_YEAR  # total days to read (all ranks)
-    if rank == 0 and streaming_ok:
-        print(f"\n  Streaming mode: ENABLED "
-              f"(per-day I/O–Compute overlap, fused_stats_kernel, 4 GPU workers)")
+    if streaming_ok and rank == 0:
+        print(f"\n  Streaming mode: ENABLED (I/O–Compute overlap, 4 GPU workers)")
 
     if rank == 0:
+        io_label = f"{IO_THREADS} threads" if IO_THREADS > 1 else "1 thread"
         raw_label = "raw I/O" if raw_info else "netCDF4"
-        print(f"\nReading {day_count_target} days per rank "
-              f"(MPI distributed per-day, float16, {raw_label}, "
+        print(f"\nReading {len(my_years)} years per rank "
+              f"(MPI distributed, float16, {raw_label}, {io_label}, "
               f"direct-to-shm) ...")
     comm.Barrier()
     t_io = time.time()
@@ -1016,23 +928,41 @@ def main():
     if rank == 0 and streaming_ok:
         bands = build_bands()
         t_gpu = time.time()
-        gpu_threads, threshold, climatology = _compute_streaming_by_day(
-            data, ready_flags, bands, fused_fn, num_gpus)
+        gpu_threads, threshold, climatology = _compute_streaming(
+            data, ready_flags, bands, accumulate_fn, finalize_fn, num_gpus)
 
-    # ── I/O: per-day with Barrier sync + ready_flags signaling ──
-    def _read_single_file(yr_idx, day_slot, fp):
+    # ── I/O: year-by-year with ready_flags signaling ──
+    def _read_single_file(yr_idx, idx_slot, fp):
         block = (raw_read_sst(fp, raw_info) if raw_info
                  else _read_netcdf_fallback(fp, sst_var))
         block = np.squeeze(block)
         if block.shape != (N_LAT, N_LON):
             block = block.T
-        data[yr_idx, day_slot] = np.asarray(block, dtype=np.float16)
+        data[yr_idx, idx_slot % N_DAYS_PER_YEAR] = \
+            np.asarray(block, dtype=np.float16)
 
-    for day_idx in range(N_DAYS_PER_YEAR):
-        for yr_idx, fp in my_day_files[day_idx]:
-            _read_single_file(yr_idx, day_idx, fp)
-        comm.Barrier()  # all 30 ranks: data[:, day_idx, :, :] is complete
-        ready_flags[day_idx] = 1  # signal GPU workers
+    for yr in my_years:
+        yr_idx = int(yr) - START_YEAR
+        year_files = by_year[yr]
+
+        if IO_THREADS > 1 and len(year_files) > IO_THREADS:
+            n_per = (len(year_files) + IO_THREADS - 1) // IO_THREADS
+            with ThreadPoolExecutor(max_workers=IO_THREADS) as pool:
+                futures = []
+                for t in range(IO_THREADS):
+                    chunk = year_files[t * n_per:(t + 1) * n_per]
+                    if chunk:
+                        futures.append(pool.submit(
+                            lambda c=chunk, yi=yr_idx: [
+                                _read_single_file(yi, slot, fp)
+                                for slot, fp in c]))
+                for f in futures:
+                    f.result()
+        else:
+            for slot, fp in year_files:
+                _read_single_file(yr_idx, slot, fp)
+
+        ready_flags[yr_idx] = 1  # signal GPU workers: year ready
 
     comm.Barrier()
     io_elapsed = time.time() - t_io
@@ -1109,7 +1039,7 @@ def main():
 
     # ── Timing breakdown ──
     prep_elapsed = t_io - _t0 - setup_time
-    mode_label = "per-day streaming" if streaming_ok else "batch"
+    mode_label = "streaming" if streaming_ok else "batch"
 
     print(f"\n{'='*60}")
     print(f"  TIMING BREAKDOWN (MPI, float16, {mode_label})")
