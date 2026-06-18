@@ -328,6 +328,30 @@ with ctx.Pool(processes=N_SAVE_WORKERS) as pool:
 - 首轮 band 的 7.0s 计算完全被 I/O（6.8s）覆盖
 - 仅剩第 2/3 轮 band 的 3.3s 计算尾量在 I/O 完成后执行
 
+### 问题 26：按天边读边算尝试 — 淘汰
+
+**现象**：尝试将 I/O 粒度从按年（102 文件）细化到按天（1 文件），用 `fused_stats_kernel`（n_days=1, n_total=330）逐输出天计算，期望消除 compute tail。结果 Competition 32s（Barrier 同步）和 27s（per-rank 标志），均显著慢于 per-year 方案 18.1s。
+
+**测试数据（f16r4n13）**：
+
+| 指标 | Per-year 流式（基线） | Per-day + Barrier | Per-day + per-rank flags |
+|------|---------------------|-------------------|-------------------------|
+| I/O | 6.8s | 17.1s | 11.5s |
+| Compute | 10.3s | 18.5s | 15.5s |
+| Compute tail | 3.3s | 0.1s | 3.7s |
+| **Competition** | **18.1s** | **32.0s** | **27.0s** |
+
+**根因 1 — Barrier 放大 Lustre 尾延迟**：102 次 Barrier 强制 30 rank 每步同步，最慢 rank 的单文件 Lustre 抖动（100-300ms）拖慢全步。换 per-rank 标志数组后 I/O 从 17.1s 降到 11.5s，但仍比 per-year 的 6.8s 差。Per-year 无中间 Barrier，fast rank 可连续读完 102 文件，尾延迟被平均化。
+
+**根因 2 — 滑动窗口导致 11 倍冗余 GPU 读取（致命）**：`fused_stats_kernel` 每输出天独立处理 330 个样本，相邻输出天的 11 天窗口有 10 天重叠：
+```
+输出天 0: data[:, 0:11]  → 330 样本 → kernel 读取
+输出天 1: data[:, 1:12]  → 330 样本 → kernel 读取 (10/11 重叠!)
+```
+每个输入天被 GPU 内核读取 **11 次**（92 × 330 / 30 / 102 = 11）。对比 per-year `accumulate_year_kernel` 每个数据元素精确处理一次（寄存器中一次累加覆盖 92 个输出天），per-day 的 GPU 带宽浪费 10 倍。Compute 从 10.3s 涨到 15.5s 直接归因于此。
+
+**结论**：对于滑动窗口聚合类计算，按最外层维度（年）做流式累加是最优的——利用结合律在寄存器中逐步累积，每个数据元素只处理一次。细化粒度的思路虽然缩短了首次结果延迟，但由于窗口重叠导致的冗余计算抵消了全部 I/O 重叠收益。**此方案永久淘汰。**
+
 ### 问题 24：参数扫描确定最优值
 
 **现象**：不确定 IO_THREADS、SAVE_WORKERS、SUB_BATCH_DAYS 最优值。
@@ -376,6 +400,9 @@ with ctx.Pool(processes=N_SAVE_WORKERS) as pool:
 14. **HIP kernel 索引用 64-bit**：`day * n_total * rows * n_lon` 超 INT32_MAX，必须用 long long
 15. **降级 setuptools < 70**：高版本移除 pkg_resources，load/load_inline 依赖它
 16. **HIP 融合 kernel 收益巨大**：nanean + topk 合并为单次遍历，Compute 14.5→7.4s（-49%）
+17. **利用结合律实现边读边算**：P90/top-34 和 mean 跨年份可结合，将单一 fused kernel 拆为 per-year accumulate + finalize，使 GPU 计算与 I/O 重叠，Competition 22-27s → 18.1s
+18. **MPI 共享内存天然适合流式同步**：int8 ready_flags 数组在共享物理页上，写操作对所有 rank 立即可见，无需显式同步原语
+19. **流式粒度不是越细越好**：per-day（1 文件）vs per-year（102 文件）因滑动窗口重叠导致 11 倍 GPU 冗余读取，compute 从 10.3s 涨到 15.5s。对于窗口聚合，应选最外层维度做流式——利用结合律，每元素只处理一次
 
 ---
 
