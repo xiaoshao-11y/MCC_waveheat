@@ -55,8 +55,7 @@ SUB_BATCH_DAYS = int(os.environ.get("SUB_BATCH_DAYS", "92"))
 IO_THREADS = int(os.environ.get("IO_THREADS", "2"))
 
 FLAGS_PAD = 64
-MAX_RANKS = 64
-FLAGS_COUNT = N_DAYS_PER_YEAR * MAX_RANKS  # 102 days × 64 max ranks — per-rank-per-day ready flags
+FLAGS_COUNT = N_DAYS_PER_YEAR  # 102 — one ready flag per day (per-day streaming)
 
 
 # ── Calendar helpers ───────────────────────────────────────────────────────
@@ -753,9 +752,6 @@ def _compute_streaming_by_day(data, ready_flags, bands, fused_fn, num_gpus):
     Each GPU thread pre-allocates the full 102-day window, copies day slices
     as they become ready, and computes output days as their 11-day windows
     complete using the existing fused_stats_kernel (n_days=1, n_total=330).
-
-    ready_flags layout: ready_flags[day * MAX_RANKS + rank] int8.
-    A day is ready when all N_YEARS rank-slots for that day are set to 1.
     """
     import torch
     import threading
@@ -778,11 +774,9 @@ def _compute_streaming_by_day(data, ready_flags, bands, fused_fn, num_gpus):
             # Pre-allocate full 102-day window on GPU
             gpu_data = torch.empty(N_YEARS, N_DAYS_PER_YEAR, rows_total, N_LON,
                                    dtype=torch.float16, device=gpu_id)
-            # Per-day I/O: poll per-rank flags for this day
-            n_readers = N_YEARS  # number of ranks producing data (= years)
+            # Per-day I/O: copy arriving day slices for my band rows
             for day_idx in range(N_DAYS_PER_YEAR):
-                flag_base = day_idx * MAX_RANKS
-                while not np.all(ready_flags[flag_base:flag_base + n_readers]):
+                while ready_flags[day_idx] == 0:
                     _time.sleep(0.0005)  # 0.5ms poll interval
 
                 # Copy this day's data for all my bands
@@ -1025,7 +1019,7 @@ def main():
         gpu_threads, threshold, climatology = _compute_streaming_by_day(
             data, ready_flags, bands, fused_fn, num_gpus)
 
-    # ── I/O: per-day, per-rank flags (no Barrier → no tail-latency amplification) ──
+    # ── I/O: per-day with Barrier sync + ready_flags signaling ──
     def _read_single_file(yr_idx, day_slot, fp):
         block = (raw_read_sst(fp, raw_info) if raw_info
                  else _read_netcdf_fallback(fp, sst_var))
@@ -1037,8 +1031,8 @@ def main():
     for day_idx in range(N_DAYS_PER_YEAR):
         for yr_idx, fp in my_day_files[day_idx]:
             _read_single_file(yr_idx, day_idx, fp)
-        # Per-rank flag: each rank owns its slot, no Barrier
-        ready_flags[day_idx * MAX_RANKS + rank] = 1
+        comm.Barrier()  # all 30 ranks: data[:, day_idx, :, :] is complete
+        ready_flags[day_idx] = 1  # signal GPU workers
 
     comm.Barrier()
     io_elapsed = time.time() - t_io
