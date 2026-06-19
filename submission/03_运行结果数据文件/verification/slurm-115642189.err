@@ -1,0 +1,9 @@
+/opt/gridview/slurm/spool_slurmd/job115642189/slurm_script: line 18:   753 Killed                  matlab -nodisplay -nosplash -nodesktop < /public/home/pan2174/sdp/clim_verification.m 2>&1
+
+real	0m8.794s
+user	0m0.449s
+sys	0m0.337s
+
+real	0m34.132s
+user	0m3.474s
+sys	0m4.900s

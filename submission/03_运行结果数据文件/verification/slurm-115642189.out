@@ -1,0 +1,177 @@
+=========================================
+  验证方式 1: MATLAB
+=========================================
+---------------------------------------------------------------------------
+Warning: Cannot locate Java Runtime Environment (JRE) . . .
+ 
+         1. Either a correct JRE was not available for redistribution when
+            this release was shipped, in which case you should refer to the
+            Release Notes for additional information about how to get it.
+ 
+         2. Or you have tried to use the MATLAB_JAVA environment variable
+            to specify an alternate JRE, but MATLAB cannot find it.  Please
+            run 'matlab -n' to determine what value you are using for
+            MATLAB_JAVA and fix accordingly.
+---------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+       Segmentation violation detected at Fri Jun 19 16:56:37 2026 +0800
+--------------------------------------------------------------------------------
+
+Configuration:
+  Crash Decoding           : Disabled - No sandbox or build area path
+  Crash Mode               : continue (default)
+  Default Encoding         : UTF-8
+  GNU C Library            : 2.17 stable
+  MATLAB Architecture      : glnxa64
+  MATLAB Root              : /public/home/pan2174/install
+  MATLAB Version           : 9.4.0.813654 (R2018a)
+  Operating System         : "CentOS Linux release 7.6.1810 (Core) "
+  Process ID               : 753
+  Processor ID             : x86 Family 159 Model 0 Stepping 1, HygonGenuine
+  Session Key              : b324d134-841f-432c-971d-75b17197e948
+  Static TLS mitigation    : Disabled: Unable to open display
+
+Fault Count: 1
+
+
+Abnormal termination
+
+Register State (from fault):
+  RAX = 0000000000000000  RBX = 00002b1512711148
+  RCX = 00002b153021bc80  RDX = 00002b1530000078
+  RSP = 00002b152bfff3d0  RBP = 00002b152bfff720
+  RSI = 0000000000000000  RDI = 00002b1530000020
+
+   R8 = 0000000000000001   R9 = 0000000000000000
+  R10 = 0000000000000001  R11 = 00002b14fde4a470
+  R12 = 0000000000000000  R13 = 00002b152bfffbd0
+  R14 = 00002b152bfff4c0  R15 = 00002b152bfffd20
+
+  RIP = 00002b1512426fbb  EFL = 0000000000010246
+
+   CS = 0033   FS = 0000   GS = 0000
+
+Stack Trace (from fault):
+[  0] 0x00002b1512426fbb                            bin/glnxa64/libmwmcr.so+00556987
+[  1] 0x00002b151246a318                            bin/glnxa64/libmwmcr.so+00832280
+[  2] 0x00002b151243d644                            bin/glnxa64/libmwmcr.so+00648772
+[  3] 0x00002b15124363f1                            bin/glnxa64/libmwmcr.so+00619505
+[  4] 0x00002b14fd359dd5                             /lib64/libpthread.so.0+00032213
+[  5] 0x00002b14fbadfead                                   /lib64/libc.so.6+01040045 clone+00000109
+[  6] 0x0000000000000000                                   <unknown-module>+00000000
+
+** This crash report has been saved to disk as /public/home/pan2174/matlab_crash_dump.753-1 **
+
+
+
+MATLAB is exiting because of fatal error
+[MATLAB 失败，以下运行 Python 验证]
+
+=========================================
+  验证方式 2: Python
+=========================================
+  读取: 0601.nc
+  读取: 0602.nc
+  读取: 0603.nc
+  读取: 0604.nc
+  读取: 0605.nc
+  读取: 0606.nc
+  读取: 0607.nc
+  读取: 0608.nc
+  读取: 0609.nc
+  读取: 0610.nc
+  读取: 0611.nc
+  读取: 0612.nc
+  读取: 0613.nc
+  读取: 0614.nc
+  读取: 0615.nc
+  读取: 0616.nc
+  读取: 0617.nc
+  读取: 0618.nc
+  读取: 0619.nc
+  读取: 0620.nc
+  读取: 0621.nc
+  读取: 0622.nc
+  读取: 0623.nc
+  读取: 0624.nc
+  读取: 0625.nc
+  读取: 0626.nc
+  读取: 0627.nc
+  读取: 0628.nc
+  读取: 0629.nc
+  读取: 0630.nc
+  读取: 0701.nc
+  读取: 0702.nc
+  读取: 0703.nc
+  读取: 0704.nc
+  读取: 0705.nc
+  读取: 0706.nc
+  读取: 0707.nc
+  读取: 0708.nc
+  读取: 0709.nc
+  读取: 0710.nc
+  读取: 0711.nc
+  读取: 0712.nc
+  读取: 0713.nc
+  读取: 0714.nc
+  读取: 0715.nc
+  读取: 0716.nc
+  读取: 0717.nc
+  读取: 0718.nc
+  读取: 0719.nc
+  读取: 0720.nc
+  读取: 0721.nc
+  读取: 0722.nc
+  读取: 0723.nc
+  读取: 0724.nc
+  读取: 0725.nc
+  读取: 0726.nc
+  读取: 0727.nc
+  读取: 0728.nc
+  读取: 0729.nc
+  读取: 0730.nc
+  读取: 0731.nc
+  读取: 0801.nc
+  读取: 0802.nc
+  读取: 0803.nc
+  读取: 0804.nc
+  读取: 0805.nc
+  读取: 0806.nc
+  读取: 0807.nc
+  读取: 0808.nc
+  读取: 0809.nc
+  读取: 0810.nc
+  读取: 0811.nc
+  读取: 0812.nc
+  读取: 0813.nc
+  读取: 0814.nc
+  读取: 0815.nc
+  读取: 0816.nc
+  读取: 0817.nc
+  读取: 0818.nc
+  读取: 0819.nc
+  读取: 0820.nc
+  读取: 0821.nc
+  读取: 0822.nc
+  读取: 0823.nc
+  读取: 0824.nc
+  读取: 0825.nc
+  读取: 0826.nc
+  读取: 0827.nc
+  读取: 0828.nc
+  读取: 0829.nc
+  读取: 0830.nc
+  读取: 0831.nc
+
+==================================================
+       6~8月夏季 RMSE 统计结果
+==================================================
+气候态 平均误差 : 0.0002 °C
+气候态 最大误差 : 0.0002 °C
+--------------------------------------------------
+P90分位 平均误差 : 0.0129 °C
+P90分位 最大误差 : 0.0139 °C
+==================================================
+
+结果已保存到 /public/home/pan2174/sdp/verification/
