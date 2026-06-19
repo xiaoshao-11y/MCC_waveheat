@@ -4,9 +4,9 @@
 
 MCC 海洋计算挑战赛，基于 1991-2020 年全球海表温度 (SST) 数据，计算夏季 (6-8 月) 气候态均值 (Climmean) 和 90% 分位阈值 (P90_sst)。算法为 11 天滑动窗口，30 年基线。
 
-## 当前阶段
+## 项目状态：已完工提交
 
-**MPI + 4GPU 并行 + HIP 边读边算流水线 + 并行 Save，Competition ~15s（比赛规则全流程计时）。**
+**MCC2026 初赛作品 «青数海洋» (MCC20264732)，Competition 15.0s，加速比 4185×。**
 
 | 阶段 | 状态 |
 |------|------|
@@ -51,10 +51,8 @@ Competition: 15.0s  = Prep + Setup + I/O + compute_tail(2.9s) + Save
 |---------------|------|
 | 内存映射 | MPI 共享内存窗口创建 |
 | 初始化 | HIP kernel JIT 编译 |
-| 预热 | **已移除**（所有 warmup 方案在比赛计时下均为净亏损） |
+| 预热 | micro-warmup（串行，Setup 内 4 GPU 各 ~0.8s） |
 | I/O + Compute + Save | 全流程
-
-每 GPU 3 bands 总时间 ~5.5s。GPU 预热消除了 HIP kernel JIT 编译开销（首 band 从 ~3.5s → ~2.4s），剩余首 band 开销可能来自线程级 CUDA context 初始化。
 
 节点优先策略：`f16r4n02 > f16r4n12 > f16r4n03 > f16*`（f16r4n13 共享节点性能波动大；f16r4n12 /dev/shm 偶尔有问题，但实测 I/O 较好）
 
@@ -119,9 +117,9 @@ Competition: 15.0s  = Prep + Setup + I/O + compute_tail(2.9s) + Save
 
 1. **HIP 融合内核不可替代**：torch.topk 在 8.1M 个独立序列上的通用排序比寄存器级 top-34 慢 3 倍以上（Compute 30s+ vs 8s）。
 2. **边读边算利用结合律**：P90/top-34 和 mean 跨年可逐步累加，将 fused kernel 拆为 per-year accumulate + finalize，使 7.0s Compute 与 6.8s I/O 重叠，Competition 22-27s → 18.1s。
-3. **Setup 成为新瓶颈**：5.0s Setup 中 HIP 驱动加载 GPU 二进制到指令缓存是硬件操作，无软件绕过。微 warmup 仅占 ~1.2s/GPU。
-4. **流式模式减少 per-band 波动**：accumulate kernel 无需 unfold+permute+reshape，per-band 时间更均匀（~2.3-2.5s vs 1.4-5s）。
-5. **比赛规则下 ~18s 接近当前架构天花板**：I/O 已被覆盖，Setup 5.0s 是硬件限制，剩余优化空间在 compute tail 和 Save。
+3. **Setup 3.6s 是硬件限制**：HIP 驱动加载 GPU 二进制到指令缓存无法软件绕过，串行 warmup 保持最优。
+4. **流式模式减少 per-band 波动**：accumulate kernel 无需 unfold+permute+reshape，per-band 时间均匀（~2.0-2.3s vs 1.4-5s）。
+5. **15.0s 为当前最优成绩**：I/O 已被覆盖，compute tail 2.9s 和 Setup 3.6s 是剩余关键路径，均为硬件/架构限制。
 
 ## 性能演进
 
@@ -152,7 +150,7 @@ sdp/
 └── logs/                      # SLURM 任务日志
 ```
 
-## 已完成的优化路线
+## 优化路线总览
 
 - [x] MPI I/O + float16 全程计算
 - [x] Direct-to-shm I/O 消除 gather
@@ -170,18 +168,8 @@ sdp/
 - [x] GPU buffer 预分配：year_gpu 张量复用，避免 30 年 × 3 bands 重复 CUDA 分配
 - [x] batch kernel 测试（淘汰：np.stack 开销 + 延迟启动抵消批量收益）
 
-## 下一步计划
 
-| 优先级 | 方向 | 预估收益 | 说明 |
-|--------|------|---------|------|
-| P0 | **节点优选** | ~3s | Setup 5.0s 依赖于 DCU 驱动初始化速度，不同节点差异大 |
-| P1 | 预编译 HIP .so | ~22s（仅冷启动） | 消除首次 JIT 编译。方案：预先在 `.fused_kernel/` 编译好 .so，运行时直接加载 |
-| P2 | 减少 MPI rank 数 | ~1-2s | 30 rank 的 Barrier 开销。15 rank 各读 2 年 |
-| P3 | 内核指令优化 | ~1s | accumulate_year_kernel 展开 11 天循环，减少分支 |
-| - | 双服务器 | — | 已排除（Lustre MDS 瓶颈不变） |
-| - | NB 调整 | — | 已排除（NB=12 最优） |
-
-## 瓶颈分析（边读边算流水线, f16r4n02）
+## 最终性能分析（f16r4n02）
 
 | 阶段 | 时间 | 占比 | 备注 |
 |------|------|------|------|
