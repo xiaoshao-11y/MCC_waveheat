@@ -45,12 +45,10 @@ if [ -z "${SLURM_JOB_ID}" ]; then
     echo ">> 空闲节点 (${IDLE_COUNT}个): $(echo ${IDLE_NODES} | tr '\n' ' ')"
 
     # f17* nodes: fast I/O but extremely slow torch import (~60s vs 20s)
-    # Node I/O ranking (24w): n13~13s, n03~14s, n12~15s >> n02~29s
-    # Strategy: f16r4n13 > f16r4n03 > f16r4n12 > f16* > fallback
-    PREFERRED=$(echo "${IDLE_NODES}" | grep "^f16r4n13$")
-    if [ -z "${PREFERRED}" ]; then
-        PREFERRED=$(echo "${IDLE_NODES}" | grep "^f16r4n03$")
-    fi
+    # Node ranking (Competition, 30-rank MPI streaming):
+    #   n02 15.0s >> n12 17.5s >> n13 18.1s (shared, noisy)
+    # Strategy: f16r4n02 > f16r4n12 > f16* > fallback
+    PREFERRED=$(echo "${IDLE_NODES}" | grep "^f16r4n02$")
     if [ -z "${PREFERRED}" ]; then
         PREFERRED=$(echo "${IDLE_NODES}" | grep "^f16r4n12$")
     fi

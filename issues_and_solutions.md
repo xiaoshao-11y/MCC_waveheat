@@ -410,7 +410,7 @@ with ctx.Pool(processes=N_SAVE_WORKERS) as pool:
 14. **HIP kernel 索引用 64-bit**：`day * n_total * rows * n_lon` 超 INT32_MAX，必须用 long long
 15. **降级 setuptools < 70**：高版本移除 pkg_resources，load/load_inline 依赖它
 16. **HIP 融合 kernel 收益巨大**：nanean + topk 合并为单次遍历，Compute 14.5→7.4s（-49%）
-17. **利用结合律实现边读边算**：P90/top-34 和 mean 跨年份可结合，将单一 fused kernel 拆为 per-year accumulate + finalize，使 GPU 计算与 I/O 重叠，Competition 22-27s → 18.1s
+17. **利用结合律实现边读边算**：P90/top-34 和 mean 跨年份可结合，将单一 fused kernel 拆为 per-year accumulate + finalize，使 GPU 计算与 I/O 重叠，Competition 22-27s → 18.1s → **15.0s（节点优选）**
 18. **MPI 共享内存天然适合流式同步**：int8 ready_flags 数组在共享物理页上，写操作对所有 rank 立即可见，无需显式同步原语
 19. **流式粒度不是越细越好**：per-day（1 文件）vs per-year（102 文件）因滑动窗口重叠导致 11 倍 GPU 冗余读取，compute 从 10.3s 涨到 15.5s。对于窗口聚合，应选最外层维度做流式——利用结合律，每元素只处理一次
 20. **HIP 多 GPU 预热必须串行**：驱动层 kernel ISA 加载存在锁竞争，4 线程并行 warmup（期望 ~2s）反而膨胀到 ~10s
@@ -429,37 +429,38 @@ with ctx.Pool(processes=N_SAVE_WORKERS) as pool:
 | **+ GPU warmup + parallel save** | 5.5s | 5.5-7.0s | ~12s Total（老计时，不含 Prep/Setup） |
 | **比赛规则适配** | 8-11s | 5.4-7.5s | **~22-27s Competition** |
 | **边读边算流水线（当前）** | 10.3s | 6.8s | **~18.1s Competition**（I/O 与 Compute 重叠）|
+| **+ 节点优选 f16r4n02** | 8.9s | 5.8s | **~15.0s Competition**（当前最优）|
 
-### 当前计时拆分 (边读边算流水线, NB=12, WH=5, f16r4n13)
+### 当前计时拆分 (边读边算流水线, NB=12, WH=5, f16r4n02)
 
 | 阶段 | 时间 | 占比 | 说明 |
 |------|------|------|------|
-| Prep | ~1.6s | 9% | imports + 路径构造 + 格式探测 + MPI window |
-| Setup | ~5.0s | 28% | HIP kernel 编译 + 4 GPU micro-warmup（accumulate kernel） |
-| I/O | ~6.8s | — | MPI 30 ranks, raw byte I/O, direct-to-shm（与 Compute 重叠） |
-| Compute | ~10.3s | — | 4×DCU Z200 流式（7.0s 在 I/O 阶段 + 3.3s tail） |
-| Save | ~1.2s | 7% | 92 个 NetCDF, 4 进程 fork COW |
-| **Competition** | **~18.1s** | — | = Prep + Setup + I/O + compute_tail + Save |
+| Prep | ~1.7s | 11% | imports + 路径构造 + 格式探测 + MPI window |
+| Setup | ~3.6s | 24% | HIP kernel 编译 + 4 GPU micro-warmup（accumulate kernel） |
+| I/O | ~5.8s | — | MPI 30 ranks, raw byte I/O, direct-to-shm（与 Compute 重叠） |
+| Compute | ~8.9s | — | 4×DCU Z200 流式（6.0s 在 I/O 阶段 + 2.9s tail） |
+| Save | ~0.8s | 5% | 92 个 NetCDF, 4 进程 fork COW |
+| **Competition** | **~15.0s** | — | = Prep + Setup + I/O + compute_tail + Save |
 
-Competition = 1.6 + 5.0 + 6.8 + 3.3 + 1.2 ≈ 18.1s。Compute 的 7.0s 被 I/O 完全覆盖。
+Competition = 1.7 + 3.6 + 5.8 + 2.9 + 0.8 ≈ 15.0s。Compute 的 6.0s 被 I/O 完全覆盖。
 
-### 18s 时间构成详解
+### 15s 时间构成详解
 
 ```
 时间轴 ──────────────────────────────────────────────────────────►
 
-  0s    1.6s       6.6s                             13.4s  14.6s  18.1s
+  0s    1.7s       5.3s                             11.1s  12.0s  15.0s
   │ Prep │  Setup   │                               │      │      │
-  │      │          │          I/O (6.8s)            │ tail │ Save  │
-  │      │          │                                │(3.3s)│(1.2s)│
+  │      │          │          I/O (5.8s)            │ tail │ Save  │
+  │      │          │                                │(2.9s)│(0.8s)│
   │      │          ├────────────────────────────────┤      │      │
-  │      │          │  Compute round 1 (7.0s)        │ r2,r3│      │
+  │      │          │  Compute round 1 (6.0s)        │ r2,r3│      │
   │      │          │  ← 被 I/O 完全覆盖 →           │      │      │
   │      │          │                                │      │      │
   ▼      ▼          ▼                                ▼      ▼      ▼
  start  Prep       GPU                               I/O    全GPU  Competition
         完成       threads                         Barrier  完成   结束
-                  启动                              (6.8s)
+                  启动                              (5.8s)
 ```
 
 ### Compute per-GPU per-band（流式模式, 3 bands/GPU）

@@ -37,13 +37,13 @@ sdp/
        │
        ▼
   ┌────────────────────────────────────┐
-  │  Prep: 文件索引 + 格式探测           │  ← 1.6s
+  │  Prep: 文件索引 + 格式探测           │  ← 1.7s
   │  探测 raw byte I/O offset           │
   └────────────────────────────────────┘
        │
        ▼
   ┌────────────────────────────────────┐
-  │  Setup: backend 检测                │  ← 5.0s
+  │  Setup: backend 检测                │  ← 3.6s
   │  + HIP 4 kernels 编译               │    accumulate_year + finalize
   │  + 4 GPU 条件 micro-warmup          │    + fused_stats + batch (备用)
   └────────────────────────────────────┘
@@ -59,12 +59,12 @@ sdp/
   │    → data[Y,:,r0:r1,:]  │    30 年齐 → finalize_kernel         │
   │  ready_flags[Y] = 1 ────→    D2H → 写结果到 threshold/clim     │
   │                          │                                     │
-  │  ~6.8s                   │  ~7.0s (被 I/O 覆盖) + 3.3s tail    │
+  │  ~5.8s                   │  ~6.0s (被 I/O 覆盖) + 2.9s tail    │
   └──────────────────────────┴─────────────────────────────────────┘
        │                          │
        ▼  comm.Barrier()         ▼
   ┌────────────────────────────────────┐
-  │  Rank 0: join GPU threads          │  ← compute tail ~3.3s
+  │  Rank 0: join GPU threads          │  ← compute tail ~2.9s
   │  非 rank 0: return                  │
   └────────────────────────────────────┘
        │
@@ -72,7 +72,7 @@ sdp/
        │
   ┌────────────────────────────────────┐
   │  Save: 92 个 .nc 文件               │  ← netCDF4, 4 进程 fork COW
-  │  Climatology/MMDD.nc                │    ~1.2s
+  │  Climatology/MMDD.nc                │    ~0.8s
   └────────────────────────────────────┘
        │
        ▼
@@ -90,24 +90,24 @@ sdp/
 │ │ MPI 启动 + Python import + torch.cuda.init │ │
 │ │ ┌──────────────────────────────────────┐ │ │
 │ │ │ main()  _t0 = time.time()            │ │ │
-│ │ │   Prep   1.6s  (imports + index +     │ │ │
+│ │ │   Prep   1.7s  (imports + index +     │ │ │
 │ │ │                 format probe + window)│ │ │
-│ │ │   Setup  5.0s  (kernel compile +      │ │ │
+│ │ │   Setup  3.6s  (kernel compile +      │ │ │
 │ │ │                 micro-warmup 4 GPUs)  │ │ │
 │ │ │   ─── t_io ───                       │ │ │
 │ │ │   ┌───────────────┐                  │ │ │
-│ │ │   │ I/O   6.8s    │ ← 与 Compute 重叠 │ │ │
-│ │ │   │ Compute 7.0s  │   (首轮 band)    │ │ │
+│ │ │   │ I/O   5.8s    │ ← 与 Compute 重叠 │ │ │
+│ │ │   │ Compute 6.0s  │   (首轮 band)    │ │ │
 │ │ │   └───────────────┘                  │ │ │
 │ │ │   Barrier + join threads             │ │ │
-│ │ │   Compute tail 3.3s (第2/3轮 band)    │ │ │
-│ │ │   Save   1.2s                        │ │ │
+│ │ │   Compute tail 2.9s (第2/3轮 band)    │ │ │
+│ │ │   Save   0.8s                        │ │ │
 │ │ │   ─── t_end ───                      │ │ │
-│ │ │   Competition: 18.1s                  │ │ │
+│ │ │   Competition: 15.0s                  │ │ │
 │ │ │   Validation  ← 不计时                │ │ │
 │ │ └──────────────────────────────────────┘ │ │
 │ └──────────────────────────────────────────┘ │
-│ Shell real: ~42s (含 import + MPI 启动)      │
+│ Shell real: ~38s (含 import + MPI 启动)      │
 └──────────────────────────────────────────────┘
 ```
 
@@ -267,7 +267,7 @@ export PYTHONPYCACHEPREFIX=/tmp/pycache
 
 ### 自动节点选择
 
-优先选 **f16r4n13 > f16r4n03 > f16r4n12**，其次 f16*。
+优先选 **f16r4n02 > f16r4n12 > f16* > f16r4n13（共享）> f17***。
 
 ```bash
 USE_MPI=1 bash get_climatology.sh
